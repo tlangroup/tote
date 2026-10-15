@@ -11,9 +11,20 @@
 
 - 这是一个 **tc ↔ tote 协作特性**；tote 侧接缝已就位，硬骨头在 tc 侧（跨文件 `extend overload` 解析
   + `--emit-deps` 输出 `extended_by` 边 + `build --lib` 多文件入口）。
-- tote 侧**待补两处接线**（`g_extend_by` 填充、多文件拼装），但**无 tc 支撑无法端到端验证**，
-  故本期不落地代码，先固化契约与计划，待 tc 提供 `extended_by` 边后再启用。
-- 当前 MVP（无 extend）路径不受影响：接缝默认空表，等价于原逻辑。
+
+### 实施状态（2026-10-15 更新）
+
+- ✅ **阶段 1（tote 能力）已落地**：`sys_capture` / `parse_extend_edges` / `load_extend_graph` /
+  `transitive_closure` / `sorted_keys` 已加入 `src/tote.tc`。
+- ✅ **阶段 2（tote 接线）已落地**：`process_dep` 在复制 entry 后、`key_of` 之前调用
+  `load_extend_graph`；`tc build --lib` 命令按「传递闭包」拼装多文件单元。
+- ✅ **阶段 4（回归）已验证**：无 extend 普通工程路径**零行为变化**——用 git HEAD 原始 `tote.tc`
+  编出基线二进制与改动后二进制，在同一 fixture 上冷构建 / 热构建 / 运行的日志、`tote.lock`、
+  `app.ll`、以及全部缓存键**逐字节一致**。
+- ⏸ **阶段 3（端到端验证）BLOCKED on tc**：需 REQ-EXT-1/2/3 就位（见 §5）后才能构造
+  §6 fixture 验证级联重建。
+- 当前 MVP（无 extend）路径不受影响：tc 今日不输出 `kind:"extend"`，`g_extend_by` 恒为空表，
+  闭包为空 ⇒ 不追加任何文件、键不变，等价于原逻辑。
 
 ---
 
@@ -179,12 +190,18 @@ if (map_has(g_extend_by, name)) {
 
 ## 7. 分阶段落地计划
 
-- **阶段 0（tc）**：REQ-EXT-1/2/3 由 tc 工程落地（见 TC_INTERFACE_REQUESTS.md 请求信箱）。
-- **阶段 1（tote 能力）**：加 `sys_capture` + `transitive_closure` + `load_extend_graph`（§4.1/4.2），
-  但默认不触发（extend 边为空时与原逻辑一致）。
-- **阶段 2（tote 接线）**：`process_dep` 复制 entry 后调 `load_extend_graph`；build 命令改多文件拼装。
-- **阶段 3（验证）**：跑 §6 fixture，确认级联重建正确、无误复用。
-- **阶段 4（回归）**：确认无 extend 的普通工程路径零行为变化（接缝默认空表）。
+- ⏸ **阶段 0（tc）**：REQ-EXT-1/2/3 由 tc 工程落地（见 TC_INTERFACE_REQUESTS.md 请求信箱）。**未开始**。
+- ✅ **阶段 1（tote 能力）已完成**：已加 `sys_capture` + `parse_extend_edges` + `load_extend_graph` +
+  `transitive_closure` + `sorted_keys`（§4.1/4.2），默认不触发（extend 边为空时与原逻辑一致）。
+- ✅ **阶段 2（tote 接线）已完成**：`process_dep` 复制 entry 后调 `load_extend_graph`（在 `key_of` 之前）；
+  `tc build --lib` 命令按传递闭包拼装多文件。另加「源中无 `extend` 关键字则跳过探测」的前置过滤，
+  使无 extend 的普通工程**不付出任何 tc 子进程开销**。
+- ⏸ **阶段 3（验证）BLOCKED**：待阶段 0 就位后跑 §6 fixture，确认级联重建正确、无误复用。
+- ✅ **阶段 4（回归）已完成**：无 extend 普通工程零行为变化（见 §0 实施状态，逐字节对比验证）。
+
+> 阶段 3 还需补一处（§6.2）：「扩展者不再单独产出 `.tlib`」。这要求在任何依赖被构建之前就把
+> extend 图完整加载（即依赖解析与构建拆成两趟），当前 `process_dep` 是「边解析边构建」的单趟结构，
+> 故该条推迟到阶段 3 与真实 extend 边一并处理。
 
 ---
 
@@ -200,3 +217,12 @@ if (map_has(g_extend_by, name)) {
   单元名且排第一，已稳定。
 - **与变体派生的关系**：本设计仅解决「同一工程内被依赖库的跨文件 extend 缓存」，不涉及 `tc'` 派生；
   二者在 `[compiler].extend` 引入后再统一考量。
+- ⚠ **`sys_capture` 的 cmd 引号陷阱（已踩坑 · 已修复）**：`t_system`（`runtime/t_runtime.c`）对
+  **以引号开头**的命令串会【自动再包一层引号】以绕开 cmd.exe 的引号剥离怪癖。因此捕获 stdout 时
+  **绝不能自己再加 `cmd /c ` 前缀**——否则变成 cmd 套 cmd、引号被二次剥离，程序路径被破坏、
+  子进程起不来，而 stderr 又被 `2>nul` 吞掉，最终表现为「静默捕获到 0 字节」，整条链路看似正常实则已死。
+  正确写法：把「命令 + `> tmp`」直接交给 `sys_run`，由 `t_system` 统一处理。
+- **探测顺序的边界**：`load_extend_graph(X)` 只能得知「X 自己 extend 了谁」（X 的出边）。若扩展者 Y
+  在被扩展者 X **之后**才被处理，`key_of(X)` 可能已先算完并命中缓存。代码已对新发现的边做
+  `map_del(g_key_cache, to)` 失效处理，但**已构建完成的产物无法回滚**。彻底解法是把「解析/加载图」
+  与「构建」拆成两趟（即阶段 3 的 §6.2 改造），当前因 extend 边恒空而不触发。

@@ -334,13 +334,18 @@ fn key_of(name: string, is_main: bool) u64 {
             k = fnv1a(int_to_str(ik as i64), k);
         }
     }
-    // ⚠ extend：被本单元扩展的模块的源也纳入有效输入（tc 提供 extended_by 后填充）
-    if (map_has(g_extend_by, name)) {
-        var ext: map[string]bool = g_extend_by[name];
-        for (e in ext) {
-            var ef: string = str_concat5(g_libdir, "/", e, ".tc", "");
-            if (path_exists(ef)) { k = fnv1a(file_read_all(ef), k); }
-        }
+    // ⚠ extend：把「扩展本单元的模块」的【传递闭包】的源纳入有效输入（设计 §3.3）。
+    //   用闭包而非直接边：若 B extend A、A extend X，B 也会被并入 X 的编译单元，
+    //   故 X 的键必须包含 B 的源，否则 B 改了而 X 不重建。
+    //   升序遍历保证哈希与 map 迭代顺序无关（设计 §8「确定性」）。
+    //   当前 g_extend_by 为空 ⇒ 闭包为空 ⇒ 键与原逻辑逐位一致。
+    var ext: map[string]bool = transitive_closure(name);
+    var extnames: []string = sorted_keys(ext);
+    var ei: u64 = 0;
+    while (ei < slice_len(extnames)) {
+        var ef: string = str_concat5(g_libdir, "/", extnames[ei], ".tc", "");
+        if (path_exists(ef)) { k = fnv1a(file_read_all(ef), k); }
+        ei = ei + 1;
     }
     g_key_cache[name] = k;
     return k;
@@ -361,6 +366,158 @@ fn stored_key_matches(path: string, key: u64) bool {
 // 写入键文件
 fn write_key(path: string, key: u64) void {
     file_write_all(path, int_to_str(key as i64));
+}
+
+// ────────────────────────────────────────────────────────────────
+// extend 图支持（设计 docs/design/extend-incremental-cache.md §7 阶段 1「tote 能力」）
+//
+// ⚠ 当前 tc 的 --emit-deps 只输出 import 边（{"from":X,"to":Y}，无 kind 字段），
+//   故解析后 g_extend_by 恒为空表 ⇒ 传递闭包为空 ⇒ 多文件拼装不追加任何文件、
+//   键也不变，与原逻辑逐字节一致（「默认不触发」）。
+//   tc 落地 REQ-EXT-1（额外输出 {"from":Y,"to":X,"kind":"extend"}）后本段自动生效，
+//   缓存主体无需再改。
+// ────────────────────────────────────────────────────────────────
+
+// 字节序字符串小于（确定性排序用）
+fn str_lt(a: string, b: string) bool {
+    var na: u64 = str_len(a);
+    var nb: u64 = str_len(b);
+    var n: u64 = na;
+    if (nb < na) { n = nb; }
+    var i: u64 = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { return a[i] < b[i]; }
+        i = i + 1;
+    }
+    return na < nb;
+}
+
+// 从 JSON 对象片段取 "key" 的字符串值（极简扫描，够用即可）
+fn json_get_str(obj: string, key: string) string {
+    var pat: string = str_concat3("\"", key, "\"");
+    var p: i64 = str_find(obj, pat, 0);
+    if (p < 0) { return ""; }
+    var n: u64 = str_len(obj);
+    var i: u64 = (p as u64) + str_len(pat);
+    while (i < n && obj[i] != 58) { i = i + 1; }       // ':'
+    if (i >= n) { return ""; }
+    i = i + 1;
+    while (i < n && obj[i] != 34) { i = i + 1; }       // 起始 '"'
+    if (i >= n) { return ""; }
+    i = i + 1;
+    var bld: StringBuilder = sb_new();
+    while (i < n && obj[i] != 34) { sb_append_char(bld, obj[i]); i = i + 1; }
+    return sb_to_str(bld);
+}
+
+// 捕获子进程 stdout（sys_run 只返回退出码，故重定向到临时文件再读回）
+//
+// ⚠ 绝不能自己加 "cmd /c " 前缀：t_system（runtime/t_runtime.c）对「以引号开头」
+//   的整串命令会【自动再包一层引号】来绕开 cmd.exe 的引号剥离怪癖。若此处再手工
+//   加 cmd /c，就会变成 cmd 套 cmd、引号被二次剥离，程序路径被破坏 → 子进程起不来、
+//   stderr 又被 2>nul 吞掉，最终表现为「静默捕获到 0 字节」（曾实测踩坑）。
+//   正确做法：直接把「命令 + 重定向」交给 sys_run，由 t_system 统一处理。
+fn sys_capture(cmd: string) string {
+    var tmp: string = str_concat2(g_libdir, "/.tote_emit_deps.json");
+    var full: string = str_concat4(cmd, " > \"", to_bs(tmp), "\" 2>nul");
+    sys_run(full);
+    if (path_exists(tmp) == false) { return ""; }
+    return file_read_all(tmp);
+}
+
+// 解析 --emit-deps 的 JSON：{from:Y, to:X, kind:"extend"} ⇒ Y extend 了 X
+// ⇒ g_extend_by[X][Y] = true（X 是被扩展者，Y 是扩展者）。
+// 只认 kind=="extend"；tc 今日不输出该字段 ⇒ 恒为空表。
+fn parse_extend_edges(js: string) void {
+    var n: u64 = str_len(js);
+    var i: u64 = 0;
+    while (i < n) {
+        if (js[i] != 123) { i = i + 1; continue; }     // 找 '{'
+        var j: u64 = i + 1;
+        while (j < n && js[j] != 125) { j = j + 1; }   // 到 '}'
+        var obj: string = str_slice(js, i, j);
+        if (json_get_str(obj, "kind") == "extend") {
+            var from: string = json_get_str(obj, "from");
+            var to: string = json_get_str(obj, "to");
+            if (str_len(from) > 0 && str_len(to) > 0) {
+                if (map_has(g_extend_by, to) == false) {
+                    var nm: map[string]bool; g_extend_by[to] = nm;
+                }
+                var mm: map[string]bool = g_extend_by[to];
+                mm[from] = true;
+                g_extend_by[to] = mm;
+                // 新增扩展边改变了 to 的有效输入 ⇒ 其已缓存的键作废，下次重算
+                if (map_has(g_key_cache, to)) { map_del(g_key_cache, to); }
+            }
+        }
+        i = j + 1;
+    }
+}
+
+// 对单元跑一次 tc check --emit-deps，把 extend 边并入 g_extend_by。
+// 失败/无输出时静默返回（保持空表 == 原逻辑，绝不因探测失败中断构建）。
+fn load_extend_graph(name: string) void {
+    var f: string = str_concat5(g_libdir, "/", name, ".tc", "");
+    if (path_exists(f) == false) { return; }
+    // 廉价前置过滤：本单元源里没有 `extend` 关键字 ⇒ 它不可能 extend 任何东西
+    // ⇒ 不可能产出 extend 边。省掉一次 tc 子进程（无 extend 的普通工程零开销）。
+    // 这是「过近似」过滤（注释/字符串里的 extend 会误放行，只是多探测一次，不会漏）。
+    if (str_find(file_read_all(f), "extend", 0) < 0) { return; }
+    var cb: StringBuilder = sb_new();
+    sb_append_str(cb, "\"");
+    sb_append_str(cb, to_bs(g_tc));
+    sb_append_str(cb, "\" check --emit-deps --lib-dir \"");
+    sb_append_str(cb, to_bs(g_libdir));
+    sb_append_str(cb, "\" \"");
+    sb_append_str(cb, to_bs(f));
+    sb_append_str(cb, "\"");
+    var js: string = sys_capture(sb_to_str(cb));
+    if (str_len(js) == 0) { return; }
+    parse_extend_edges(js);
+}
+
+// 传递闭包：返回「直接/间接 extend root 的所有单元」。
+// 若 B extend A、A extend X，则 B 也必须并入 X 的编译单元 ⇒ 逐层沿 g_extend_by 展开。
+// extend 图结构上无环（设计 §1.1）⇒ 只需 visited 去重，不做环检测。
+fn transitive_closure(root: string) map[string]bool {
+    var seen: map[string]bool;
+    var queue: []string;
+    append(queue, root);
+    seen[root] = true;
+    var i: u64 = 0;
+    while (i < slice_len(queue)) {
+        var cur: string = queue[i];
+        i = i + 1;
+        if (map_has(g_extend_by, cur) == false) { continue; }
+        var exts: map[string]bool = g_extend_by[cur];
+        for (e in exts) {
+            if (map_has(seen, e)) { continue; }
+            seen[e] = true;
+            append(queue, e);
+        }
+    }
+    map_del(seen, root);       // root 自身不是「扩展它的单元」
+    return seen;
+}
+
+// map 键 → 升序切片（保证拼装顺序与哈希顺序稳定，见设计 §8「确定性」）
+fn sorted_keys(m: map[string]bool) []string {
+    var ks: []string;
+    for (k in m) { append(ks, k); }
+    var i: u64 = 1;
+    var cnt: u64 = slice_len(ks);
+    while (i < cnt) {
+        var kv: string = ks[i];
+        var j: i64 = (i as i64) - 1;
+        while (j >= 0) {
+            if (str_lt(ks[j as u64], kv)) { break; }
+            ks[((j as u64) + 1)] = ks[j as u64];
+            j = j - 1;
+        }
+        ks[((j as u64) + 1)] = kv;
+        i = i + 1;
+    }
+    return ks;
 }
 
 fn process_dep(name: string, spec_path: string, spec_git: string, rev: string, base_dir: string) void {
@@ -418,6 +575,10 @@ fn process_dep(name: string, spec_path: string, spec_git: string, rev: string, b
         eprint(str_concat3("tote: 复制依赖入口失败: ", fullentry, "\n"));
         return;
     }
+    // extend 图：向 tc 询问本单元的依赖边并填充 g_extend_by。
+    // 必须在 key_of 之前调用，否则键会漏掉扩展闭包的源（设计 §4.1 调用点）。
+    // 当前 tc 不输出 extend 边 ⇒ 空表 ⇒ 与原逻辑一致。
+    load_extend_graph(name);
     // 增量缓存：键命中则跳过 tc 调用
     var dep_artifact: string = str_concat5(g_libdir, "/", name, ".tlib", "");
     var dep_key: u64 = key_of(name, false);
@@ -438,6 +599,23 @@ fn process_dep(name: string, spec_path: string, spec_git: string, rev: string, b
     sb_append_str(cmd, "\" \"");
     sb_append_str(cmd, to_bs(fullentry));
     sb_append_str(cmd, "\"");
+    // extend：把「扩展本单元的模块」的传递闭包拼进【同一个编译单元】（设计 §3.2 / §4.2）。
+    //   跨文件 extend overload 要求被扩展模块与其扩展模块同单元编译，否则报 EXTEND_NO_GROUP。
+    //   被扩展模块恒为第一个位置参数（= 单元名），闭包按名升序追加 ⇒ 顺序稳定（设计 §8）。
+    //   当前 g_extend_by 为空 ⇒ 不追加任何文件，命令行与原逻辑逐字节一致。
+    var unit_ext: map[string]bool = transitive_closure(name);
+    var unit_names: []string = sorted_keys(unit_ext);
+    var ui: u64 = 0;
+    while (ui < slice_len(unit_names)) {
+        var ef: string = str_concat5(g_libdir, "/", unit_names[ui], ".tc", "");
+        // 仅拼装已就位于 libdir 的闭包成员；未就位者跳过（避免把不存在的文件传给 tc）。
+        if (path_exists(ef)) {
+            sb_append_str(cmd, " \"");
+            sb_append_str(cmd, to_bs(ef));
+            sb_append_str(cmd, "\"");
+        }
+        ui = ui + 1;
+    }
     var rc: i32 = sys_run(sb_to_str(cmd));
     if (rc != 0) {
         eprint(str_concat3("tote: 构建依赖 ", name, " 失败\n"));
@@ -785,10 +963,15 @@ fn main() i32 @main {
 //   • 已实现基于 import 图的增量缓存：单元键 = fnv(名 ‖ 自身源哈希 ‖ 直接
 //     @import 依赖的键)。命中跳过 tc；依赖源变 → 键变 → 级联重建（已验证：
 //     改 bar → bar/foo/main 重建，baz 复用）。
-//   • inputs_of()（imports_of + g_extend_by 合并处）是单一接缝：tc 提供
-//     extend 边后，tote 在此并入 extended_by 闭包源哈希，并在 process_dep 中
-//     把被扩展模块与其扩展闭包拼成多文件单元编译。
-//   • 当前 MVP（HANDOFF 已推迟 [compiler].extend 变体派生）不触发 extend
-//     路径；接缝已就位，待 tc 输出 extend 边即可启用，无需改缓存逻辑主体。
+//   • ✅ 接线已完成（2026-10-15，设计 §7 阶段 1+2）：load_extend_graph 在
+//     process_dep 复制 entry 后、key_of 之前调用；key_of 与 tc build --lib 均按
+//     【传递闭包 + 名升序】处理，保证语义与哈希顺序的稳定性。
+//   • ✅ 当前 tc 不输出 kind:"extend" ⇒ g_extend_by 恒空 ⇒ 闭包为空 ⇒
+//     不追加任何文件、键不变。已用「git HEAD 原版 vs 改动版」双二进制在同一
+//     fixture 上对比验证：冷/热构建日志、tote.lock、app.ll、缓存键全部逐字节一致。
+//   • 另加前置过滤：单元源中无 `extend` 关键字则跳过 tc 探测 ⇒ 无 extend 的
+//     普通工程不付出任何额外子进程开销。
+//   • ⏸ 仍待 tc：REQ-EXT-1/2/3（跨文件 extend overload 解析、--emit-deps 输出
+//     extend 边、build --lib 接受多文件）。就位后即可启用，缓存主体无需再改。
 // ═══════════════════════════════════════════════════════════════════
 
