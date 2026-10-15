@@ -1,0 +1,74 @@
+// 自测：解析 tote.toml + 一段含依赖/数组/浮点的合成 TOML。
+@import("src.toml");
+
+fn main() i32 @main {
+    // 1) 真实 tote.toml
+    var src: string = file_read_all("tote.toml");
+    var doc: i64 = toml.parse_toml(src);
+    var e: string = toml.err_msg();
+    if (str_len(e) > 0) { eprint("PARSE ERR: " + e + "\n"); return 1; }
+    println("[tote.toml]");
+    println("  name    = " + toml.get_str(doc, "package", "name", "?"));
+    println("  version = " + toml.get_str(doc, "package", "version", "?"));
+    println("  entry   = " + toml.get_str(doc, "package", "entry", "?"));
+    println("  backend = " + toml.get_str(doc, "build", "backend", "?"));
+    println("  mode    = " + toml.get_str(doc, "build", "mode", "?"));
+    println("  opt-dev = " + int_to_str(toml.get_int(doc, "profile.dev", "opt-level", -1)));
+    var dbg: string = "false";
+    if (toml.get_bool(doc, "profile.dev", "debug", false)) { dbg = "true"; }
+    println("  dbg-dev = " + dbg);
+
+    // 2) 合成 TOML：依赖 + 数组 + 浮点
+    var syn: string =
+        "[package]\n" +
+        "name = \"app\"\n" +
+        "[dependencies]\n" +
+        "\"path:./libs/foo\" = \"1.0\"\n" +
+        "\"git:https://x/y\" = \"rev:abc\"\n" +
+        "[dev-dependencies]\n" +
+        "\"path:./libs/testutil\" = \"0.2\"\n" +
+        "authors = [\"alice\", \"bob\"]\n" +
+        "ratio = 3.14\n" +
+        "[profile.release]\n" +
+        "opt-level = 3\n" +
+        "[meta]\n" +
+        "author.name = \"alice\"\n" +
+        "author.email = \"a@b.c\"\n" +
+        "[dependencies.demo]\n" +
+        "path = \"./libs/demo\"\n" +
+        "version = \"0.5\"\n";
+    var d2: i64 = toml.parse_toml(syn);
+    if (str_len(toml.err_msg()) > 0) { eprint("SYN ERR: " + toml.err_msg() + "\n"); return 1; }
+    println("[synthetic]");
+    println("  name = " + toml.get_str(d2, "package", "name", "?"));
+    var m: map[string]string;
+    toml.get_table_strs(d2, "dependencies", m);
+    println("  dependencies:");
+    for (k in m) {
+        println("    " + k + " => " + m[k]);
+    }
+    var md: map[string]string;
+    toml.get_table_strs(d2, "dev-dependencies", md);
+    println("  dev-dependencies:");
+    for (k in md) {
+        println("    " + k + " => " + md[k]);
+    }
+    var authlen: i64 = toml.get_arr_len(d2, "dev-dependencies", "authors");
+    println("  authors:");
+    var ai: i64 = 0;
+    while (ai < authlen) {
+        println("    - " + toml.get_arr_str(d2, "dev-dependencies", "authors", ai));
+        ai = ai + 1;
+    }
+    println("  ratio (float) = " + toml.get_str(d2, "dev-dependencies", "ratio", "?"));
+    println("  opt-rel = " + int_to_str(toml.get_int(d2, "profile.release", "opt-level", -1)));
+    println("  dotted meta.author.name  = " + toml.get_str(d2, "meta.author", "name", "?"));
+    println("  dotted meta.author.email = " + toml.get_str(d2, "meta.author", "email", "?"));
+    var cd: map[string]bool;
+    toml.get_child_tables(d2, "dependencies", cd);
+    println("  deps (sub-tables):");
+    for (dn in cd) {
+        println("    - " + dn + "  path=" + toml.get_str(d2, "dependencies." + dn, "path", "?"));
+    }
+    return 0;
+}

@@ -1,0 +1,9 @@
+[package]
+name = "foo"
+version = "0.1.0"
+entry = "src/foo.tc"
+
+# 传递依赖：foo 依赖 bar（验证 resolver 递归 + 库间链接）
+[dependencies.bar]
+path = "../bar"
+version = "0.1.0"

@@ -1,0 +1,32 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+entry = "src/main.tc"
+
+[build]
+backend = "llvm"
+mode = "dbg"
+out_dir = "out"
+
+# 路径依赖：普通本地库（验证 resolve → 构建 .tlib → 链接）
+[dependencies.foo]
+path = "./libs/foo"
+version = "0.1.0"
+
+[dependencies.bar]
+path = "./libs/bar"
+version = "0.1.0"
+
+# git 依赖：用本地仓库模拟远程（验证 fetcher 的 clone/checkout）
+[dependencies.baz]
+git = "./_repos/baz"
+rev = "main"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+debug = false

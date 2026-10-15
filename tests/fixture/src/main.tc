@@ -1,0 +1,11 @@
+@import("foo")
+@import("bar")
+@import("baz")
+
+fn main() i32 @main {
+    // 仅 main 使用字符串拼接（单个模块定义 .tirll_tstr0，不会重复）。
+    println("foo_add(2,3)      = " + int_to_str(foo.foo_add(2, 3)));
+    println("bar_id()          = " + int_to_str(bar.bar_id()));
+    println("baz_val()         = " + int_to_str(baz.baz_val()));
+    return 0;
+}

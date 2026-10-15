@@ -1,0 +1,24 @@
+# tote.lock — 自动生成，永远提交（DESIGN D10）
+[lock]
+version = "1"
+mode = "dbg"
+
+[dependencies.bar]
+name = "bar"
+source = "path"
+resolved = "libs/bar"
+entry = "src/bar.tc"
+
+[dependencies.foo]
+name = "foo"
+source = "path"
+resolved = "libs/foo"
+entry = "src/foo.tc"
+
+[dependencies.baz]
+name = "baz"
+source = "git"
+resolved = "out/git/baz"
+rev = "main"
+entry = "src/baz.tc"
+

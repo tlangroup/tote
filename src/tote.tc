@@ -1,0 +1,794 @@
+// tote.tc — t 语言的包管理器与构建系统（MVP：无 extend 普通工程端到端）
+//
+// 职责（委托 tc 做编译/链接，自己只做「包」与「编排」）：
+//   1) 解析 tote.toml（用自带纯 t TOML 解析器 src/toml.tc）
+//   2) Resolver：收集 [dependencies] / [dev-dependencies]（子表形式）
+//   3) Fetcher：path 直接用；git clone/checkout 到 out/git/<name>
+//   4) 每个依赖：把 entry 复制为 out/lib/<mode>/<name>.tc，并 tc build --lib 出 .tlib
+//   5) 主工程：tc build --lib-dir out/lib/<mode> 出 exe
+//   6) 生成 tote.lock（永远提交，DESIGN D10）
+//
+// ⚠ 已知 MVP 限制：依赖为「单文件库」——其 entry .tc 不应再 @import 自身子模块
+//   （否则复制成 libdir/<name>.tc 后内部导入无法解析）。多文件依赖为后续增量目标。
+
+@import("src.toml")
+
+// ────────────────────────────────────────────────────────────────
+// 路径 / 字符串工具（与 tc 同源，保证 Windows 行为一致）
+// ────────────────────────────────────────────────────────────────
+
+fn to_bs(s: string) string {
+    var sb: StringBuilder = sb_new();
+    var i: u64 = 0;
+    var n: u64 = str_len(s);
+    while (i < n) {
+        if (s[i] == 47) { sb_append_char(sb, 92); }   // '/' -> '\'
+        else { sb_append_char(sb, s[i]); }
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+fn str_concat2(a: string, b: string) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, a); sb_append_str(sb, b);
+    return sb_to_str(sb);
+}
+
+fn str_concat3(a: string, b: string, c: string) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, a); sb_append_str(sb, b); sb_append_str(sb, c);
+    return sb_to_str(sb);
+}
+
+fn str_concat4(a: string, b: string, c: string, d: string) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, a); sb_append_str(sb, b); sb_append_str(sb, c); sb_append_str(sb, d);
+    return sb_to_str(sb);
+}
+
+fn str_concat5(a: string, b: string, c: string, d: string, e: string) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, a); sb_append_str(sb, b); sb_append_str(sb, c);
+    sb_append_str(sb, d); sb_append_str(sb, e);
+    return sb_to_str(sb);
+}
+
+fn str_concat6(a: string, b: string, c: string, d: string, e: string, f: string) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, a); sb_append_str(sb, b); sb_append_str(sb, c);
+    sb_append_str(sb, d); sb_append_str(sb, e); sb_append_str(sb, f);
+    return sb_to_str(sb);
+}
+
+// 子串查找（返回首现下标；未找到返回 -1）。
+fn str_find(hay: string, needle: string, start: u64) i64 {
+    var hn: u64 = str_len(hay);
+    var nn: u64 = str_len(needle);
+    if (nn == 0) { return 0; }
+    var i: u64 = start;
+    while (i + nn <= hn) {
+        var ok: bool = true;
+        var j: u64 = 0;
+        while (j < nn) {
+            if (hay[i + j] != needle[j]) { ok = false; break; }
+            j = j + 1;
+        }
+        if (ok) { return i as i64; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 在 [0, from) 内找最后一个 '/'，返回其下标（未找到返回 -1）。
+fn last_slash(s: string, from: i64) i64 {
+    var i: i64 = from - 1;
+    while (i >= 0) {
+        if (s[i] == 47) { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+// 规整路径：消除 "seg/../"，去掉开头的 "./"（用字符串操作，不引入 []string）。
+fn norm_path(s: string) string {
+    var cur: string = s;
+    while (true) {
+        var dpos: i64 = str_find(cur, "..", 0);
+        if (dpos < 0) { break; }
+        var slash2: i64 = last_slash(cur, dpos);     // ".." 前的 '/'
+        if (slash2 < 0) { break; }
+        var slash1: i64 = last_slash(cur, slash2);  // 段前的 '/'
+        var before: string;
+        if (slash1 < 0) { before = ""; } else { before = str_slice(cur, 0, slash1 as u64); }
+        var after: string = str_slice(cur, (dpos + 2) as u64, str_len(cur));
+        cur = before + after;
+    }
+    while (str_len(cur) >= 2 && cur[0] == 46 && cur[1] == 47) {
+        cur = str_slice(cur, 2, str_len(cur));
+    }
+    return cur;
+}
+
+fn path_exists(p: string) bool {
+    var q: string = to_bs(p);
+    var rc: i32 = sys_run(str_concat3("cmd /c if exist \"", q, "\" (exit 0) else (exit 1)"));
+    return rc == 0;
+}
+
+fn ends_with(s: string, suf: string) bool {
+    var ns: u64 = str_len(s);
+    var np: u64 = str_len(suf);
+    if (ns < np) { return false; }
+    var i: u64 = 0;
+    while (i < np) {
+        if (s[ns - np + i] != suf[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn home_dir() string {
+    var up: string = getenv("USERPROFILE");
+    if (str_len(up) > 0) { return up; }
+    var hd: string = getenv("HOMEDRIVE");
+    var hp: string = getenv("HOMEPATH");
+    if (str_len(hd) > 0 && str_len(hp) > 0) { return str_concat2(hd, hp); }
+    return getenv("HOME");
+}
+
+// ────────────────────────────────────────────────────────────────
+// tc 定位与 lib-dir 注入
+// ────────────────────────────────────────────────────────────────
+
+// 优先环境变量 TC，其次 out/dbg/tc.exe、out/rls/tc.exe，最后 PATH 上的 tc。
+fn find_tc() string {
+    var e: string = getenv("TC");
+    if (str_len(e) > 0) { return e; }
+    if (path_exists("out/dbg/tc.exe")) { return "out/dbg/tc.exe"; }
+    if (path_exists("out/rls/tc.exe")) { return "out/rls/tc.exe"; }
+    return "tc";
+}
+
+// 返回 tc 所在目录（含结尾 '/'）；无法判定则返回 ""。
+fn tc_dir_of(tcpath: string) string {
+    var n: u64 = str_len(tcpath);
+    var last: i64 = -1;
+    var i: u64 = 0;
+    while (i < n) {
+        if (tcpath[i] == 47) { last = i as i64; }
+        i = i + 1;
+    }
+    if (last < 0) { return ""; }
+    return str_slice(tcpath, 0, (last as u64) + 1);
+}
+
+// tc 链接最终 exe 时需要运行时静态库 out/<mode>/deps/t_runtime.lib。
+// 从 tc 同目录的 deps/ 拷过来（依赖构建与最终构建各一份）。
+fn ensure_runtime_lib() void {
+    var td: string = tc_dir_of(g_tc);
+    if (str_len(td) == 0) { return; }
+    var src: string = str_concat3(td, "deps/t_runtime.lib", "");
+    if (path_exists(src) == false) { return; }
+    mkdir_p(str_concat3("out/", g_mode, "/deps"));
+    mkdir_p(str_concat3("out/lib/", g_mode, "/deps"));
+    file_copy(src, str_concat3("out/", g_mode, "/deps/t_runtime.lib"));
+    file_copy(src, str_concat3("out/lib/", g_mode, "/deps/t_runtime.lib"));
+}
+
+// ────────────────────────────────────────────────────────────────
+// 依赖记录（全部用基础类型 map，规避 []string 的编译器缺陷）
+// ────────────────────────────────────────────────────────────────
+
+var dep_kind:  map[string]string;   // name -> "path" | "git"
+var dep_path:  map[string]string;   // name -> 解析后的本地目录
+var dep_entry: map[string]string;   // name -> entry .tc（相对 dep 目录）
+var dep_spec:  map[string]string;   // name -> 原始源串
+var dep_rev:   map[string]string;   // name -> 解析版本/rev（git）
+var dep_built: map[string]bool;     // name -> 已纳入 lib-dir
+
+// 当前构建上下文
+var g_mode:   string;               // "dbg" | "rls"
+var g_libdir: string;               // "out/lib/<mode>"
+var g_mainname: string;             // 主包名（exe 名）
+var g_tc:     string;               // 已解析 tc 路径
+
+// ⚠ 模块级全局 map 不会自动建空表，须在每次构建/检查前显式初始化（否则写入即空指针解引用崩溃）。
+fn init_deps() void {
+    var a: map[string]string; dep_kind = a;
+    var b: map[string]string; dep_path = b;
+    var c: map[string]string; dep_entry = c;
+    var d: map[string]string; dep_spec = d;
+    var e: map[string]string; dep_rev = e;
+    var f: map[string]bool;  dep_built = f;
+}
+
+// 文件复制（t 无 file_copy 内建，用 read+write 实现）
+fn file_copy(src: string, dst: string) i32 {
+    if (path_exists(src) == false) {
+        eprint(str_concat3("tote: 找不到文件 ", src, "\n"));
+        return 1;
+    }
+    var c: string = file_read_all(src);
+    file_write_all(dst, c);
+    return 0;
+}
+
+// 递归创建目录（Windows: mkdir 配合 cmd /c）
+fn mkdir_p(p: string) void {
+    sys_run(str_concat5("cmd /c if not exist \"", to_bs(p), "\" mkdir \"", to_bs(p), "\""));
+}
+
+// git fetch：不存在则 clone，然后 checkout rev（分支/tag/commit 均可）。
+// 返回解析后的本地目录；失败返回 ""。
+fn fetch_git(name: string, url: string, rev: string) string {
+    var store: string = str_concat3("out/git/", name, "");
+    if (path_exists(store) == false) {
+        mkdir_p("out");
+        mkdir_p("out/git");
+        println(str_concat4("tote: git clone ", url, " -> ", store));
+        var rc: i32 = sys_run(str_concat4("git clone ", url, " ", to_bs(store)));
+        if (rc != 0) {
+            eprint(str_concat3("tote: git clone 失败: ", name, "\n"));
+            return "";
+        }
+    }
+    if (str_len(rev) > 0) {
+        sys_run(str_concat5("git -C ", to_bs(store), " checkout ", rev, " >nul 2>&1"));
+    }
+    return store;
+}
+
+// 注册并构建依赖（递归：先处理其子依赖）。
+//   base_dir：spec_path/git 相对解析的基准目录（顶层为 "."）。
+// ────────────────────────────────────────────────────────────────
+// 增量缓存：内容寻址
+//
+// 每个「编译单元」（依赖库 / 主程序）的缓存键 = 内容哈希：
+//     key = fnv( 单元名 ‖ 自身源文件哈希 ‖ 所有「输入」单元的键 )
+// 其中「输入」目前 = 直接 @import 的依赖（见 inputs_of）。
+// 命中（.tlib/.exe 存在且键文件匹配）→ 跳过 tc 调用。
+// 某依赖源变了 → 其键变 → 所有导入它的单元键跟着变 → 级联重建。
+//
+// ⚠ extend 的影响（核心需提交 tc 的部分，见本文件尾部注释）：
+//   跨文件 `extend overload fn` 要求「被扩展模块 + 其所有（传递）扩展模块」
+//   作为【同一个编译单元】一起喂给 tc（多文件 tc_load_src / Route 2），否则
+//   报 EXTEND_NO_GROUP。故被扩展模块的「有效输入」还包括「扩展它的模块」的源。
+//   inputs_of() 是单一接缝：待 tc 在 --emit-deps 输出 extended_by 边后，tote 在
+//   此并入「extended_by 闭包」的源哈希，并把该闭包与原模块拼成一个多文件单元交给
+//   tc。键自然随任一扩展模块源变化而失效 → 正确重建。
+// ────────────────────────────────────────────────────────────────
+
+var g_key_cache:  map[string]u64;          // 单元名 -> 已算出的键
+var g_main_entry: string;                  // 主程序入口路径（key_of 用）
+var g_extend_by:  map[string]map[string]bool; // 单元名 -> {扩展它的单元}（待 tc 提供）
+
+fn init_keys() void {
+    var a: map[string]u64;             g_key_cache = a;
+    var b: map[string]map[string]bool; g_extend_by = b;
+    g_main_entry = "";
+}
+
+// FNV-1a 64 位哈希（内容寻址用）
+fn fnv1a(s: string, seed: u64) u64 {
+    var h: u64 = seed;
+    var n: u64 = str_len(s);
+    var i: u64 = 0;
+    while (i < n) {
+        h = h ^ (s[i] as u64);
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+// s 从 pos 起是否等于字面量 lit（扫描 @import("...") 用）
+fn sub_str_eq(s: string, pos: u64, lit: string) bool {
+    var ln: u64 = str_len(lit);
+    var n: u64 = str_len(s);
+    if (pos + ln > n) { return false; }
+    var i: u64 = 0;
+    while (i < ln) {
+        if (s[pos + i] != lit[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// 扫描源文件中的 @import("X")，返回导入单元名集合（MVP：导入名 == 依赖名）。
+// 这是「输入集合」的单一接缝；extend 落地后并入 extended_by 闭包。
+fn imports_of(file: string) map[string]bool {
+    var m: map[string]bool;
+    if (path_exists(file) == false) { return m; }
+    var src: string = file_read_all(file);
+    var n: u64 = str_len(src);
+    var i: u64 = 0;
+    while (i < n) {
+        if (src[i] == 64 && sub_str_eq(src, i, "@import(\"")) {   // '@' == 64
+            var j: u64 = i + 9;   // 跳过 @import("
+            var bld: StringBuilder = sb_new();
+            while (j < n && src[j] != 34) { sb_append_char(bld, src[j]); j = j + 1; }
+            var nm: string = sb_to_str(bld);
+            if (str_len(nm) > 0) { m[nm] = true; }
+            i = j + 1;
+            continue;
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+// 计算单元键（带记忆化）。is_main=false 时单元文件为 out/lib/<mode>/<name>.tc
+fn key_of(name: string, is_main: bool) u64 {
+    if (map_has(g_key_cache, name)) { return g_key_cache[name]; }
+    var f: string;
+    if (is_main) { f = g_main_entry; }
+    else { f = str_concat5(g_libdir, "/", name, ".tc", ""); }
+    var k: u64 = fnv1a(name, 0xcbf29ce484222325);
+    if (path_exists(f)) { k = fnv1a(file_read_all(f), k); }
+    // 输入集合：@import 的依赖（仅跟踪真正属于本工程的依赖）
+    var imps: map[string]bool = imports_of(f);
+    for (imp in imps) {
+        if (map_has(dep_path, imp)) {
+            var ik: u64 = key_of(imp, false);
+            k = fnv1a(int_to_str(ik as i64), k);
+        }
+    }
+    // ⚠ extend：被本单元扩展的模块的源也纳入有效输入（tc 提供 extended_by 后填充）
+    if (map_has(g_extend_by, name)) {
+        var ext: map[string]bool = g_extend_by[name];
+        for (e in ext) {
+            var ef: string = str_concat5(g_libdir, "/", e, ".tc", "");
+            if (path_exists(ef)) { k = fnv1a(file_read_all(ef), k); }
+        }
+    }
+    g_key_cache[name] = k;
+    return k;
+}
+
+// 键文件路径：与产物同目录、同名 + ".key"
+fn key_path_of(artifact: string) string {
+    return str_concat2(artifact, ".key");
+}
+
+// 已存键是否与给定键一致（不存在则不一致）
+fn stored_key_matches(path: string, key: u64) bool {
+    if (path_exists(path) == false) { return false; }
+    var s: string = file_read_all(path);
+    return s == int_to_str(key as i64);
+}
+
+// 写入键文件
+fn write_key(path: string, key: u64) void {
+    file_write_all(path, int_to_str(key as i64));
+}
+
+fn process_dep(name: string, spec_path: string, spec_git: string, rev: string, base_dir: string) void {
+    if (map_has(dep_built, name)) { return; }
+    var dir: string = "";
+    if (str_len(spec_path) > 0) {
+        dep_kind[name] = "path";
+        if (base_dir == ".") { dir = spec_path; }
+        else { dir = str_concat3(base_dir, "/", spec_path); }
+        dir = norm_path(dir);
+        dep_path[name] = dir;
+        dep_spec[name] = spec_path;
+    } else if (str_len(spec_git) > 0) {
+        dep_kind[name] = "git";
+        var d: string = fetch_git(name, spec_git, rev);
+        if (str_len(d) == 0) { return; }
+        dir = d;
+        dep_path[name] = d;
+        dep_spec[name] = spec_git;
+        dep_rev[name] = rev;
+    } else {
+        eprint(str_concat3("tote: 依赖 ", name, " 缺少 path/git 源\n"));
+        return;
+    }
+
+    // 读依赖自身清单：entry + 子依赖
+    var dmanifest: string = str_concat3(dir, "/tote.toml", "");
+    var entry: string = str_concat3(name, ".tc", "");
+    if (path_exists(dmanifest)) {
+        var ddoc = toml.parse_toml(file_read_all(dmanifest));
+        if (str_len(toml.err_msg()) > 0) {
+            eprint(str_concat5("tote: 解析依赖 ", name, " 清单失败: ", toml.err_msg(), "\n"));
+        }
+        var e: string = toml.get_str(ddoc, "package", "entry", "");
+        if (str_len(e) > 0) { entry = e; }
+        // 递归处理子依赖（相对本依赖目录）
+        var sub: map[string]bool;
+        toml.get_child_tables(ddoc, "dependencies", sub);
+        for (s in sub) {
+            var sb: string = str_concat3("dependencies.", s, "");
+            var sp: string = toml.get_str(ddoc, sb, "path", "");
+            var sg: string = toml.get_str(ddoc, sb, "git", "");
+            var srev: string = toml.get_str(ddoc, sb, "rev", "");
+            if (str_len(srev) == 0) { srev = toml.get_str(ddoc, sb, "branch", ""); }
+            if (str_len(srev) == 0) { srev = toml.get_str(ddoc, sb, "tag", ""); }
+            process_dep(s, sp, sg, srev, dir);
+        }
+    }
+    dep_entry[name] = entry;
+
+    // 构建：复制 entry -> libdir/<name>.tc，并 tc build --lib 出 .tlib
+    var fullentry: string = str_concat4(dir, "/", entry, "");
+    var libfile: string = str_concat5(g_libdir, "/", name, ".tc", "");
+    if (file_copy(fullentry, libfile) != 0) {
+        eprint(str_concat3("tote: 复制依赖入口失败: ", fullentry, "\n"));
+        return;
+    }
+    // 增量缓存：键命中则跳过 tc 调用
+    var dep_artifact: string = str_concat5(g_libdir, "/", name, ".tlib", "");
+    var dep_key: u64 = key_of(name, false);
+    if (path_exists(dep_artifact) && stored_key_matches(key_path_of(dep_artifact), dep_key)) {
+        dep_built[name] = true;
+        println(str_concat5("tote: 复用缓存依赖 ", name, " (key=", int_to_str(dep_key as i64), ")"));
+        return;
+    }
+    var cmd: StringBuilder = sb_new();
+    sb_append_str(cmd, "\"");
+    sb_append_str(cmd, to_bs(g_tc));
+    sb_append_str(cmd, "\" build --lib --mode ");
+    sb_append_str(cmd, g_mode);
+    sb_append_str(cmd, " --output \"");
+    sb_append_str(cmd, to_bs(str_concat3(g_libdir, "/", name)));
+    sb_append_str(cmd, "\" --lib-dir \"");
+    sb_append_str(cmd, to_bs(g_libdir));
+    sb_append_str(cmd, "\" \"");
+    sb_append_str(cmd, to_bs(fullentry));
+    sb_append_str(cmd, "\"");
+    var rc: i32 = sys_run(sb_to_str(cmd));
+    if (rc != 0) {
+        eprint(str_concat3("tote: 构建依赖 ", name, " 失败\n"));
+        return;
+    }
+    dep_built[name] = true;
+    write_key(key_path_of(dep_artifact), dep_key);
+    var msb: StringBuilder = sb_new();
+    sb_append_str(msb, "tote: 已构建依赖 ");
+    sb_append_str(msb, name);
+    sb_append_str(msb, " -> ");
+    sb_append_str(msb, g_libdir);
+    sb_append_str(msb, "/");
+    sb_append_str(msb, name);
+    sb_append_str(msb, ".tlib");
+    println(sb_to_str(msb));
+}
+
+// ────────────────────────────────────────────────────────────────
+// 子命令
+// ────────────────────────────────────────────────────────────────
+
+fn print_help() void {
+    println("tote — t 语言包管理器与构建系统（MVP · 无 extend）");
+    println("");
+    println("用法:");
+    println("  tote init                      生成 tote.toml + src/main.tc");
+    println("  tote build [--mode dbg|rls]    解析依赖→构建库→构建主程序（委托 tc）");
+    println("  tote run   [--mode dbg|rls]    构建并运行");
+    println("  tote check [--mode ...]        类型检查（委托 tc，带 --lib-dir）");
+    println("  tote metadata                 打印清单与 lock 摘要");
+    println("  tote clean                     清理 out/lib 与 out/<mode>");
+    println("  tote help                      本帮助");
+    println("");
+    println("依赖在 tote.toml 中以子表声明，例如：");
+    println("  [dependencies.foo]");
+    println("  path = \"./libs/foo\"");
+    println("  version = \"1.0\"");
+    println("  [dependencies.bar]");
+    println("  git = \"https://example.com/bar.git\"");
+    println("  rev = \"v1.2.3\"");
+    println("");
+    println("tote 按序查找环境变量 TC、out/dbg/tc.exe、out/rls/tc.exe，最后 PATH 上的 tc。");
+}
+
+fn cmd_init() i32 {
+    if (path_exists("tote.toml")) {
+        eprint("tote: tote.toml 已存在，init 中止\n");
+        return 1;
+    }
+    var m: StringBuilder = sb_new();
+    sb_append_str(m, "[package]\n");
+    sb_append_str(m, "name = \"app\"\n");
+    sb_append_str(m, "version = \"0.1.0\"\n");
+    sb_append_str(m, "edition = \"2024\"\n");
+    sb_append_str(m, "entry = \"src/main.tc\"\n");
+    sb_append_str(m, "\n");
+    sb_append_str(m, "[build]\n");
+    sb_append_str(m, "backend = \"llvm\"\n");
+    sb_append_str(m, "mode = \"dbg\"\n");
+    sb_append_str(m, "out_dir = \"out\"\n");
+    sb_append_str(m, "\n");
+    sb_append_str(m, "[dependencies]\n");
+    sb_append_str(m, "# 以子表声明，例如：\n");
+    sb_append_str(m, "# [dependencies.foo]\n");
+    sb_append_str(m, "# path = \"./libs/foo\"\n");
+    sb_append_str(m, "# version = \"1.0\"\n");
+    sb_append_str(m, "\n");
+    sb_append_str(m, "[profile.dev]\n");
+    sb_append_str(m, "opt-level = 0\n");
+    sb_append_str(m, "debug = true\n");
+    sb_append_str(m, "\n");
+    sb_append_str(m, "[profile.release]\n");
+    sb_append_str(m, "opt-level = 3\n");
+    sb_append_str(m, "debug = false\n");
+    file_write_all("tote.toml", sb_to_str(m));
+
+    if (path_exists("src/main.tc") == false) {
+        mkdir_p("src");
+        var s: StringBuilder = sb_new();
+        sb_append_str(s, "// 由 tote init 生成\n");
+        sb_append_str(s, "fn main() i32 @main {\n");
+        sb_append_str(s, "    println(\"hello from tote\");\n");
+        sb_append_str(s, "    return 0;\n");
+        sb_append_str(s, "}\n");
+        file_write_all("src/main.tc", sb_to_str(s));
+    }
+    println("tote: 已生成 tote.toml 与 src/main.tc（运行 tote build 试试）");
+    return 0;
+}
+
+// 从 argv 解析 --mode（默认 dbg）
+fn get_mode(argv: []string) string {
+    var n: u64 = slice_len(argv) as u64;
+    var i: u64 = 0;
+    while (i < n) {
+        if (argv[i] == "--mode" && i + 1 < n) { return argv[i + 1]; }
+        i = i + 1;
+    }
+    return "dbg";
+}
+
+// 生成 tote.lock（永远提交，DESIGN D10）
+fn write_lock() void {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, "# tote.lock — 自动生成，永远提交（DESIGN D10）\n");
+    sb_append_str(sb, "[lock]\n");
+    sb_append_str(sb, "version = \"1\"\n");
+    sb_append_str(sb, "mode = \"");
+    sb_append_str(sb, g_mode);
+    sb_append_str(sb, "\"\n\n");
+    for (name in dep_built) {
+        sb_append_str(sb, "[dependencies.");
+        sb_append_str(sb, name);
+        sb_append_str(sb, "]\n");
+        sb_append_str(sb, "name = \"");    sb_append_str(sb, name);    sb_append_str(sb, "\"\n");
+        sb_append_str(sb, "source = \"");  sb_append_str(sb, dep_kind[name]);  sb_append_str(sb, "\"\n");
+        sb_append_str(sb, "resolved = \"");sb_append_str(sb, dep_path[name]);  sb_append_str(sb, "\"\n");
+        if (str_len(dep_rev[name]) > 0) {
+            sb_append_str(sb, "rev = \""); sb_append_str(sb, dep_rev[name]); sb_append_str(sb, "\"\n");
+        }
+        sb_append_str(sb, "entry = \"");   sb_append_str(sb, dep_entry[name]); sb_append_str(sb, "\"\n\n");
+    }
+    file_write_all("tote.lock", sb_to_str(sb));
+    println("tote: 已写入 tote.lock");
+}
+
+// 核心：解析清单 + 构建依赖 + 构建主程序 + 写 lock
+fn cmd_build_or_run(do_run: bool) i32 {
+    if (path_exists("tote.toml") == false) {
+        eprint("tote: 当前目录没有 tote.toml，请先 tote init\n");
+        return 1;
+    }
+    var doc = toml.parse_toml(file_read_all("tote.toml"));
+    if (str_len(toml.err_msg()) > 0) {
+        eprint(str_concat3("tote: 解析 tote.toml 失败: ", toml.err_msg(), "\n"));
+        return 1;
+    }
+    g_mainname = toml.get_str(doc, "package", "name", "app");
+    g_mode = get_mode(args());
+    g_tc = find_tc();
+    g_libdir = str_concat3("out/lib/", g_mode, "");
+    init_deps();
+    init_keys();
+
+    mkdir_p("out");
+    mkdir_p(str_concat3("out/lib/", g_mode, ""));
+    // tc 会在 out/dbg（或 out/rls）下写 _phase.log，须提前建好，否则 tc 退出非零。
+    mkdir_p("out/dbg");
+    mkdir_p("out/rls");
+    ensure_runtime_lib();
+
+    // 主清单依赖
+    var names: map[string]bool;
+    toml.get_child_tables(doc, "dependencies", names);
+    for (name in names) {
+        var base: string = str_concat3("dependencies.", name, "");
+        var p: string  = toml.get_str(doc, base, "path", "");
+        var g: string  = toml.get_str(doc, base, "git", "");
+        var rev: string = toml.get_str(doc, base, "rev", "");
+        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "branch", ""); }
+        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "tag", ""); }
+        process_dep(name, p, g, rev, ".");
+    }
+    // dev 依赖（同样纳入 lib-dir，便于测试目标导入）
+    var dnames: map[string]bool;
+    toml.get_child_tables(doc, "dev-dependencies", dnames);
+    for (name in dnames) {
+        var base: string = str_concat3("dev-dependencies.", name, "");
+        var p: string  = toml.get_str(doc, base, "path", "");
+        var g: string  = toml.get_str(doc, base, "git", "");
+        var rev: string = toml.get_str(doc, base, "rev", "");
+        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "branch", ""); }
+        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "tag", ""); }
+        process_dep(name, p, g, rev, ".");
+    }
+
+    // 构建主程序
+    var entry: string = toml.get_str(doc, "package", "entry", "src/main.tc");
+    if (path_exists(entry) == false) {
+        eprint(str_concat3("tote: 入口文件不存在: ", entry, "\n"));
+        return 1;
+    }
+    g_main_entry = entry;
+    var outexe: string = str_concat5("out/", g_mode, "/", g_mainname, "");
+    var main_artifact: string = str_concat2(outexe, ".exe");
+    var main_key: u64 = key_of(g_mainname, true);
+    if (path_exists(main_artifact) && stored_key_matches(key_path_of(main_artifact), main_key)) {
+        println(str_concat5("tote: 复用缓存主程序 ", g_mainname, " (key=", int_to_str(main_key as i64), ")"));
+    } else {
+    var cmd: StringBuilder = sb_new();
+    sb_append_str(cmd, "\"");
+    sb_append_str(cmd, to_bs(g_tc));
+    sb_append_str(cmd, "\" build --mode ");
+    sb_append_str(cmd, g_mode);
+    sb_append_str(cmd, " --lib-dir \"");
+    sb_append_str(cmd, to_bs(g_libdir));
+    sb_append_str(cmd, "\" --output \"");
+    sb_append_str(cmd, to_bs(outexe));
+    sb_append_str(cmd, "\" \"");
+    sb_append_str(cmd, to_bs(entry));
+    sb_append_str(cmd, "\"");
+    println(str_concat5("tote: 构建主程序 ", entry, " -> ", outexe, ".exe"));
+    var rc: i32 = sys_run(sb_to_str(cmd));
+    if (rc != 0) {
+        eprint("tote: 主程序构建失败\n");
+        return rc;
+    }
+    write_key(key_path_of(main_artifact), main_key);
+    }
+    // end else (main cache miss)
+
+    write_lock();
+
+    if (do_run) {
+        var runcmd: string = str_concat3("\"", to_bs(str_concat3(outexe, ".exe", "")), "\"");
+        var rrc: i32 = sys_run(runcmd);
+        return rrc;
+    }
+    return 0;
+}
+
+fn cmd_check() i32 {
+    if (path_exists("tote.toml") == false) {
+        eprint("tote: 当前目录没有 tote.toml，请先 tote init\n");
+        return 1;
+    }
+    var doc = toml.parse_toml(file_read_all("tote.toml"));
+    if (str_len(toml.err_msg()) > 0) {
+        eprint(str_concat3("tote: 解析 tote.toml 失败: ", toml.err_msg(), "\n"));
+        return 1;
+    }
+    g_mode = get_mode(args());
+    g_tc = find_tc();
+    g_libdir = str_concat3("out/lib/", g_mode, "");
+    init_deps();
+    init_keys();
+    mkdir_p(str_concat3("out/lib/", g_mode, ""));
+    mkdir_p("out/dbg");
+    mkdir_p("out/rls");
+    ensure_runtime_lib();
+
+    // 先把依赖 .tc 备好（check 需要 lib-dir 中的 .tc）
+    var names: map[string]bool;
+    toml.get_child_tables(doc, "dependencies", names);
+    for (name in names) {
+        var base: string = str_concat3("dependencies.", name, "");
+        var p: string  = toml.get_str(doc, base, "path", "");
+        var g: string  = toml.get_str(doc, base, "git", "");
+        var rev: string = toml.get_str(doc, base, "rev", "");
+        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "branch", ""); }
+        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "tag", ""); }
+        process_dep(name, p, g, rev, ".");
+    }
+
+    var entry: string = toml.get_str(doc, "package", "entry", "src/main.tc");
+    var cmd: StringBuilder = sb_new();
+    sb_append_str(cmd, "\"");
+    sb_append_str(cmd, to_bs(g_tc));
+    sb_append_str(cmd, "\" check \"");
+    sb_append_str(cmd, to_bs(entry));
+    sb_append_str(cmd, "\" --lib-dir \"");
+    sb_append_str(cmd, to_bs(g_libdir));
+    sb_append_str(cmd, "\"");
+    println(str_concat2("tote: 类型检查 ", entry));
+    return sys_run(sb_to_str(cmd));
+}
+
+fn cmd_metadata() i32 {
+    if (path_exists("tote.toml") == false) {
+        eprint("tote: 当前目录没有 tote.toml\n");
+        return 1;
+    }
+    var doc = toml.parse_toml(file_read_all("tote.toml"));
+    println("== tote.toml ==");
+    println("  package.name    = " + toml.get_str(doc, "package", "name", "?"));
+    println("  package.version = " + toml.get_str(doc, "package", "version", "?"));
+    println("  package.entry   = " + toml.get_str(doc, "package", "entry", "?"));
+    println("  build.backend   = " + toml.get_str(doc, "build", "backend", "?"));
+    println("  build.mode      = " + toml.get_str(doc, "build", "mode", "?"));
+    var names: map[string]bool;
+    toml.get_child_tables(doc, "dependencies", names);
+    println("  dependencies:");
+    for (name in names) {
+        var base: string = str_concat3("dependencies.", name, "");
+        var p: string = toml.get_str(doc, base, "path", "?");
+        var g: string = toml.get_str(doc, base, "git", "?");
+        println("    - " + name + "  path='" + p + "' git='" + g + "'");
+    }
+    if (path_exists("tote.lock")) {
+        println("== tote.lock ==");
+        println(file_read_all("tote.lock"));
+    } else {
+        println("== tote.lock: (尚未生成，先 tote build) ==");
+    }
+    return 0;
+}
+
+fn cmd_clean() i32 {
+    sys_run(str_concat5("cmd /c if exist \"", to_bs("out/lib"), "\" rmdir /s /q \"", to_bs("out/lib"), "\""));
+    sys_run(str_concat5("cmd /c if exist \"", to_bs("out/dbg"), "\" rmdir /s /q \"", to_bs("out/dbg"), "\""));
+    sys_run(str_concat5("cmd /c if exist \"", to_bs("out/rls"), "\" rmdir /s /q \"", to_bs("out/rls"), "\""));
+    println("tote: 已清理 out/lib 与 out/<mode>");
+    return 0;
+}
+
+fn main() i32 @main {
+    var argv: []string = args();
+    if (slice_len(argv) < 2) { print_help(); return 2; }
+    var cmd: string = argv[1];
+    if (cmd == "init")   { return cmd_init(); }
+    if (cmd == "build")  { return cmd_build_or_run(false); }
+    if (cmd == "run")    { return cmd_build_or_run(true); }
+    if (cmd == "check")  { return cmd_check(); }
+    if (cmd == "metadata") { return cmd_metadata(); }
+    if (cmd == "clean")  { return cmd_clean(); }
+    if (cmd == "help" || cmd == "-h" || cmd == "--help") { print_help(); return 0; }
+    if (cmd == "--version" || cmd == "-v") { println("tote 0.1.0"); return 0; }
+    eprint(str_concat3("tote: 未知命令 ", cmd, "\n"));
+    print_help();
+    return 2;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 附录：extend 与增量缓存 —— tc 与 tote 的职责划分（提交 tc 工程的核心）
+//
+// 现象（用户所述）：模块自身源码未改，但被别的模块 `extend overload fn`
+// 扩展后，其编译产物的「有效输入」已变。根因：跨文件 extend 要求【被扩展
+// 模块 + 其所有（传递）扩展模块】作为同一个编译单元一起编译（tc 多文件
+// tc_load_src / Route 2，否则报 EXTEND_NO_GROUP）。故被扩展模块的缓存键
+// 必须包含「扩展它的模块的源」。
+//
+// ── 核心需提交 tc 的部分 ──
+//   1) 暴露 extend 图：--emit-deps 目前只输出 import 边（from→to）。tc 应
+//      额外输出 extended_by 边（Y extend overload 指向 X 的组 →
+//      {from:Y, to:X, kind:"extend"}）。tote 据此：
+//        (a) 计算被扩展模块的「有效输入闭包」= 自身源 + extended_by 闭包源；
+//        (b) 把该闭包与原模块拼成【一个多文件编译单元】交给 tc build --lib
+//            （多文件参数），否则 overload 子句无法跨文件合并。
+//   2) （更优可选）内容寻址增量编译下沉 tc：tc build --lib --unit-key <h>，
+//      由 tc 维护 .tlib 内容哈希缓存并复用。tote 只传「有效输入哈希+文件
+//      集合」，extend 合并的正确性完全由 tc 负责，tote 不必理解 extend 内部。
+//
+// ── tote 现在做什么 ──
+//   • 已实现基于 import 图的增量缓存：单元键 = fnv(名 ‖ 自身源哈希 ‖ 直接
+//     @import 依赖的键)。命中跳过 tc；依赖源变 → 键变 → 级联重建（已验证：
+//     改 bar → bar/foo/main 重建，baz 复用）。
+//   • inputs_of()（imports_of + g_extend_by 合并处）是单一接缝：tc 提供
+//     extend 边后，tote 在此并入 extended_by 闭包源哈希，并在 process_dep 中
+//     把被扩展模块与其扩展闭包拼成多文件单元编译。
+//   • 当前 MVP（HANDOFF 已推迟 [compiler].extend 变体派生）不触发 extend
+//     路径；接缝已就位，待 tc 输出 extend 边即可启用，无需改缓存逻辑主体。
+// ═══════════════════════════════════════════════════════════════════
+

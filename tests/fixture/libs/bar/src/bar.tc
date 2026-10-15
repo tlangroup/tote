@@ -1,0 +1,5 @@
+@module(pub)
+
+pub fn bar_id() i32 {
+    return 7;
+}

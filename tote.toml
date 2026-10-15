@@ -1,0 +1,49 @@
+# tote.toml — tote 自身（t 语言项目构建管理器）的清单
+#
+# tote 自身是一个普通 t 工程，由根 tc 直接构建（tote 不 extend tc，
+# 故无 [compiler].extend；未来若 tote 需要自定义编译器语义，再在此声明）。
+# 本文件同时作为 tote 清单 schema 的"自我示范"。
+
+[package]
+name        = "tote"
+version     = "0.1.0"
+edition     = "2026"            # 语言 edition（按需引入，避免 cargo edition 的尴尬）
+description = "t 语言项目构建管理器（cargo 精神 · 从基础重做）"
+license     = "MIT"
+authors     = ["seesaw"]
+entry       = "src/tote.tc"     # 约定优于配置：二进制目标在 src/ 下
+deps        = []                # 暂无外部依赖；运行时依赖见各依赖源
+
+# ── 编译器（可选）──────────────────────────────────────────────
+# 缺省：直接用解析到的根 tc 构建本项目，无变体派生。
+# 若本项目要自定义编译器语义，声明 extend 模块即触发"派生变体"两步构建：
+#   [compiler]
+#   extend = "src/extend.tc"     # 本工程专属 tc 变体源
+#   base   = "tc@0.9"            # 可选：指定根 tc 版本（默认解析最新兼容）
+
+[build]
+backend = "llvm"                # llvm | c
+mode    = "rls"                 # rls | dbg
+out_dir = "out"                 # 对齐既有双通道: out/dbg | out/rls
+
+[profile.dev]                   # 可覆盖的 dev 档（默认）
+opt-level = 0
+debug     = true
+
+[profile.release]               # 可覆盖的 release 档
+opt-level = 3
+debug     = false
+
+# ── 依赖（前向字段，待 tote 升级为真正的子表解析后生效）────────
+# [dependencies]                # 进入制品的普通依赖
+# "path:./libs/foo" = "1.0"     #   path 源
+# "git:https://github.com/x/y" = "rev:abc123"   # git 源
+# "tote:serde"       = "1.2"    #   registry 源（MVP 后置）
+# [dev-dependencies]            # 仅 test/bench/examples 需要（build 已并入 comptime，故无 build-deps）
+
+# ── 约定优于配置：下列目录由 tote 自动发现，无需列清单 ────────
+# src/tote.tc         → 二进制目标（entry）
+# src/lib/*.tc        → 库模块（未来拆分时用）
+# tests/              → cargo 式 test target（check + 运行）
+# examples/           → 可运行示例（.tc + 同名 .expected.txt）
+# benches/            → 基准测试目标

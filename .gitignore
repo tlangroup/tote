@@ -1,0 +1,21 @@
+# tote 构建产物
+out/
+*.tlib
+*.tlibd
+
+# 编辑器 / OS
+.DS_Store
+*.swp
+
+# 自动记忆 / 沙箱数据（不纳入版本控制）
+.workbuddy/
+
+# tc 编译器探针产物（根目录构建时产生）
+_probe_hash.ll
+_probe_hash.pdb
+
+# fixture 的 git 依赖源仓库：作为真实 git 仓库整体排除，
+# 由 tests/fixture/setup.sh 按需重建，避免主仓库嵌套 git / gitlink。
+tests/fixture/_repos/
+
+# 注意：tote.lock 永远提交（设计决策 #5），不在此忽略。

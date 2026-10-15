@@ -1,0 +1,7 @@
+@import("bar")
+@module(pub)
+
+// foo 调用 bar，验证「依赖的依赖」也能正确解析与链接。
+pub fn foo_add(a: i32, b: i32) i32 {
+    return a + b + bar.bar_id();
+}

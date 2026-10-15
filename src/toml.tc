@@ -1,0 +1,717 @@
+// toml.tc —— tote 自带的纯 t TOML 解析器（取代 tote.tc 早期字符串扫描 hack）
+//
+// 支持 tote.toml 实际用到的全部构造，并覆盖 TOML 主流子集：
+//   - 表 [pkg] / 嵌套 [pkg.sub] / 数组表 [[products]]
+//   - 点分键  a.b.c = 1
+//   - 标量：字符串（基础/多行/字面/多行字面）、整数（dec/hex/oct/bin ±）、浮点、布尔
+//   - 数组（tote 只需字符串数组；其它类型存字符串化）
+//   - 注释（#）与空白行
+//
+// ⚠ 关键实现约束：t 编译器在读「map 值为含 f64 的结构体」时（同模块内）存在代码生成
+//   缺陷（崩溃 / 返回空字段）。为规避，本解析器**不把结构体作为 map 值**：所有标量按类型
+//   存入独立的原生 map（string/i64/bool），表/键路径用「表路径 \t 键」为键编码。
+//   这样 map 值均为基础类型，规避该缺陷。
+
+@module(pub)
+
+pub const T_STR:   i32 = 3;
+pub const T_INT:   i32 = 4;
+pub const T_FLOAT: i32 = 5;
+pub const T_BOOL:  i32 = 6;
+pub const T_ARR:   i32 = 7;
+
+// 解析期临时值（仅函数内传递，不入库）。⚠ 不可含 []string 字段——
+// t 编译器把切片作为结构体字段/映射值会崩溃（arena OOM / 段错误）。
+struct TVal {
+    kind: i32;
+    s:    string;
+    i:    i64;
+    b:    bool;
+}
+
+// ── 侧表（全部为基础类型值，规避结构体入库缺陷）──────────────
+var g_strs: map[string]string;        // 表路径\t键 -> 标量/数组元素值
+var g_ints: map[string]i64;          // 表路径\t键 -> 整数值
+var g_bools: map[string]bool;        // 表路径\t键 -> 布尔值
+var g_floats: map[string]string;     // 表路径\t键 -> 浮点原文
+// ⚠ 字符串数组不再用 map[string][]string（t 编译器把 []string 存为 map 值会段错误）。
+//   改为把每个元素以「表路径\t键\t<idx>」为键存入 g_strs（与标量同库）。
+var g_tables: map[string]bool;       // 存在的表路径集合
+var g_arr_idx: map[string]i64;       // 数组表 [[x]] 的当前下标计数
+
+var g_cur_path: string;              // 当前表路径（点分段），顶层为 ""
+
+// 当前赋值的目标（由 resolve_target 在每次赋值时计算）
+var g_tp: string;                    // 目标表路径
+var g_tk: string;                    // 目标键
+
+// ── 解析期全局状态 ───────────────────────────────────────────
+var g_src: string;
+var g_pos: u64;
+var g_len: u64;
+var g_err: string;
+
+// ⚠ 多文档共存：每次 parse_toml 分配一个递增的 doc id，所有键都以
+//   "<docid>\t..." 为前缀存入侧表。访问器按 doc 参数重置 g_doc_id 后读取，
+//   使「解析主清单 → 逐个解析依赖清单」时各文档数据互不覆盖。
+var g_doc_seq: i64 = 0;
+var g_doc_id:  i64 = 0;
+// ⚠ 侧表只分配一次：后续 parse_toml 不再重建 map（否则会丢弃已解析的其它文档）。
+//   键已带 docid 前缀，故多文档共存且互不影响。
+var g_inited: bool = false;
+
+// ⚠ 模块级全局 map 在模块作用域不会自动建空表，须首次 parse_toml 时显式初始化。
+fn init_globals() void {
+    var a: map[string]string; g_strs = a;
+    var b: map[string]i64; g_ints = b;
+    var c: map[string]bool; g_bools = c;
+    var d: map[string]string; g_floats = d;
+    var f: map[string]bool; g_tables = f;
+    var g: map[string]i64; g_arr_idx = g;
+}
+
+fn set_err(msg: string) void {
+    if (str_len(g_err) == 0) { g_err = msg; }
+}
+
+fn eof() bool { return g_pos >= g_len; }
+
+fn peek() u8 {
+    if (g_pos >= g_len) { return 0; }
+    return g_src[g_pos];
+}
+
+fn peek2() u8 {
+    if (g_pos + 1 >= g_len) { return 0; }
+    return g_src[g_pos + 1];
+}
+
+fn skip_ws() void {
+    while (g_pos < g_len) {
+        var c: u8 = g_src[g_pos];
+        if (c == 32 || c == 9) { g_pos = g_pos + 1; } else { break; }
+    }
+}
+
+fn skip_line() void {
+    while (g_pos < g_len) {
+        var c: u8 = g_src[g_pos];
+        if (c == 10) { g_pos = g_pos + 1; return; }
+        g_pos = g_pos + 1;
+    }
+}
+
+// 表路径 + 键 -> 内部键（用制表符分隔，TOML 键不会含 \t）。
+// 前缀 "<docid>\t" 使多文档互不覆盖（g_doc_id 由 parse_toml / 访问器设置）。
+fn lk(tpath: string, key: string) string {
+    var sb: StringBuilder = sb_new();
+    sb_append_str(sb, int_to_str(g_doc_id));
+    sb_append_char(sb, 9);            // '\t'
+    if (str_len(tpath) > 0) {
+        sb_append_str(sb, tpath);
+        sb_append_char(sb, 9);        // '\t'
+    }
+    sb_append_str(sb, key);
+    return sb_to_str(sb);
+}
+
+// 登记某表路径存在，并登记其各级祖先（供 get_table 等判断）。
+// 键带 "<docid>\t" 前缀。
+fn mark_table(path: string) void {
+    g_tables[int_to_str(g_doc_id) + "\t" + path] = true;
+    // 祖先：按 '.' 切分逐级
+    var n: u64 = str_len(path);
+    var i: u64 = 0;
+    while (i < n) {
+        if (path[i] == 46) {          // '.'
+            var anc: string = str_slice(path, 0, i);
+            g_tables[int_to_str(g_doc_id) + "\t" + anc] = true;
+        }
+        i = i + 1;
+    }
+}
+
+// ── 数值工具 ─────────────────────────────────────────────────
+fn digit_val(c: u8) i64 {
+    if (c >= 48 && c <= 57) { return (c as i64) - 48; }
+    if (c >= 97 && c <= 102) { return (c as i64) - 87; }
+    if (c >= 65 && c <= 70) { return (c as i64) - 55; }
+    return -1;
+}
+
+pub fn parse_int(tok: string) i64 {
+    var n: u64 = str_len(tok);
+    var i: u64 = 0;
+    var neg: bool = false;
+    if (i < n && tok[i] == 45) { neg = true; i = i + 1; }
+    else if (i < n && tok[i] == 43) { i = i + 1; }
+    var base: i64 = 10;
+    if (i + 1 < n && tok[i] == 48) {
+        var nx: u8 = tok[i + 1];
+        if (nx == 120 || nx == 88) { base = 16; i = i + 2; }
+        else if (nx == 111 || nx == 79) { base = 8; i = i + 2; }
+        else if (nx == 98 || nx == 66) { base = 2; i = i + 2; }
+    }
+    var val: i64 = 0;
+    while (i < n) {
+        var d: i64 = digit_val(tok[i]);
+        if (d < 0 || d >= base) { break; }
+        val = val * base + d;
+        i = i + 1;
+    }
+    if (neg) { val = -val; }
+    return val;
+}
+
+pub fn parse_f64(tok: string) f64 {
+    var n: u64 = str_len(tok);
+    var i: u64 = 0;
+    var neg: bool = false;
+    if (i < n && tok[i] == 45) { neg = true; i = i + 1; }
+    else if (i < n && tok[i] == 43) { i = i + 1; }
+    var intpart: f64 = 0.0;
+    while (i < n && tok[i] >= 48 && tok[i] <= 57) {
+        intpart = intpart * 10.0 + ((tok[i] - 48) as f64);
+        i = i + 1;
+    }
+    var frac: f64 = 0.0;
+    var fdiv: f64 = 1.0;
+    if (i < n && tok[i] == 46) {
+        i = i + 1;
+        while (i < n && tok[i] >= 48 && tok[i] <= 57) {
+            frac = frac * 10.0 + ((tok[i] - 48) as f64);
+            fdiv = fdiv * 10.0;
+            i = i + 1;
+        }
+    }
+    var val: f64 = intpart + frac / fdiv;
+    if (i < n && (tok[i] == 101 || tok[i] == 69)) {
+        i = i + 1;
+        var eneg: bool = false;
+        if (i < n && tok[i] == 45) { eneg = true; i = i + 1; }
+        else if (i < n && tok[i] == 43) { i = i + 1; }
+        var expn: i64 = 0;
+        while (i < n && tok[i] >= 48 && tok[i] <= 57) {
+            expn = expn * 10 + ((tok[i] - 48) as i64);
+            i = i + 1;
+        }
+        var e: f64 = 1.0;
+        var k: i64 = 0;
+        while (k < expn) { e = e * 10.0; k = k + 1; }
+        if (eneg) { val = val / e; } else { val = val * e; }
+    }
+    if (neg) { val = -val; }
+    return val;
+}
+
+// ── 字符串 / 字面量 ─────────────────────────────────────────
+fn p_string(multiline: bool) TVal {
+    var nd: TVal;
+    nd.kind = T_STR;
+    if (multiline) {
+        g_pos = g_pos + 3;
+        if (eof() == false && peek() == 10) {
+            g_pos = g_pos + 1;
+            if (eof() == false && peek() == 13) { g_pos = g_pos + 1; }
+        }
+    } else {
+        g_pos = g_pos + 1;
+    }
+    var sb: StringBuilder = sb_new();
+    while (eof() == false) {
+        var c: u8 = peek();
+        if (multiline) {
+            if (c == 34 && peek2() == 34 && g_src[g_pos + 2] == 34) {
+                g_pos = g_pos + 3;
+                nd.s = sb_to_str(sb);
+                return nd;
+            }
+        } else {
+            if (c == 34) {
+                g_pos = g_pos + 1;
+                nd.s = sb_to_str(sb);
+                return nd;
+            }
+        }
+        if (c == 92) {
+            g_pos = g_pos + 1;
+            if (eof()) { break; }
+            var e: u8 = peek();
+            if (e == 110) { sb_append_char(sb, 10); g_pos = g_pos + 1; }
+            else if (e == 116) { sb_append_char(sb, 9); g_pos = g_pos + 1; }
+            else if (e == 114) { sb_append_char(sb, 13); g_pos = g_pos + 1; }
+            else if (e == 98) { sb_append_char(sb, 8); g_pos = g_pos + 1; }
+            else if (e == 102) { sb_append_char(sb, 12); g_pos = g_pos + 1; }
+            else if (e == 34) { sb_append_char(sb, 34); g_pos = g_pos + 1; }
+            else if (e == 92) { sb_append_char(sb, 92); g_pos = g_pos + 1; }
+            else if (e == 117) { g_pos = g_pos + 1; var cp: u32 = p_unicode(4); p_append_rune(sb, cp); }
+            else if (e == 85) { g_pos = g_pos + 1; var cp: u32 = p_unicode(8); p_append_rune(sb, cp); }
+            else if (multiline && e == 10) {
+                g_pos = g_pos + 1;
+                if (eof() == false && peek() == 13) { g_pos = g_pos + 1; }
+                while (eof() == false) {
+                    var w: u8 = peek();
+                    if (w == 32 || w == 9 || w == 10 || w == 13) { g_pos = g_pos + 1; } else { break; }
+                }
+            } else {
+                sb_append_char(sb, e);
+                g_pos = g_pos + 1;
+            }
+        } else {
+            sb_append_char(sb, c);
+            g_pos = g_pos + 1;
+        }
+    }
+    set_err("toml: 未闭合的字符串");
+    nd.s = sb_to_str(sb);
+    return nd;
+}
+
+fn p_literal(multiline: bool) TVal {
+    var nd: TVal;
+    nd.kind = T_STR;
+    if (multiline) {
+        g_pos = g_pos + 3;
+        if (eof() == false && peek() == 10) {
+            g_pos = g_pos + 1;
+            if (eof() == false && peek() == 13) { g_pos = g_pos + 1; }
+        }
+    } else {
+        g_pos = g_pos + 1;
+    }
+    var sb: StringBuilder = sb_new();
+    while (eof() == false) {
+        var c: u8 = peek();
+        if (multiline) {
+            if (c == 39 && peek2() == 39 && g_src[g_pos + 2] == 39) {
+                g_pos = g_pos + 3;
+                nd.s = sb_to_str(sb);
+                return nd;
+            }
+        } else {
+            if (c == 39) {
+                g_pos = g_pos + 1;
+                nd.s = sb_to_str(sb);
+                return nd;
+            }
+        }
+        sb_append_char(sb, c);
+        g_pos = g_pos + 1;
+    }
+    set_err("toml: 未闭合的字面量字符串");
+    nd.s = sb_to_str(sb);
+    return nd;
+}
+
+fn p_unicode(nhex: u64) u32 {
+    var cp: u32 = 0;
+    var k: u64 = 0;
+    while (k < nhex && eof() == false) {
+        var d: i64 = digit_val(peek());
+        if (d < 0) { break; }
+        cp = cp * 16 + (d as u32);
+        g_pos = g_pos + 1;
+        k = k + 1;
+    }
+    return cp;
+}
+
+fn p_append_rune(sb: StringBuilder, cp: u32) void {
+    if (cp < 128) {
+        sb_append_char(sb, (cp as u8));
+    } else if (cp < 2048) {
+        sb_append_char(sb, (192 + (cp >> 6)) as u8);
+        sb_append_char(sb, (128 + (cp & 63)) as u8);
+    } else {
+        sb_append_char(sb, (224 + (cp >> 12)) as u8);
+        sb_append_char(sb, (128 + ((cp >> 6) & 63)) as u8);
+        sb_append_char(sb, (128 + (cp & 63)) as u8);
+    }
+}
+
+// ── 值解析 ───────────────────────────────────────────────────
+fn p_scalar() TVal {
+    var nd: TVal;
+    var sb: StringBuilder = sb_new();
+    while (eof() == false) {
+        var c: u8 = peek();
+        if (c == 32 || c == 9 || c == 10 || c == 13 || c == 44 ||
+            c == 93 || c == 125 || c == 35) { break; }
+        sb_append_char(sb, c);
+        g_pos = g_pos + 1;
+    }
+    var tok: string = sb_to_str(sb);
+    if (str_len(tok) == 0) { set_err("toml: 空标量"); return nd; }
+    if (tok == "true") { nd.kind = T_BOOL; nd.b = true; return nd; }
+    if (tok == "false") { nd.kind = T_BOOL; nd.b = false; return nd; }
+    var is_float: bool = false;
+    var k: u64 = 0;
+    var tk: u64 = str_len(tok);
+    while (k < tk) {
+        var c: u8 = tok[k];
+        if (c == 46 || c == 101 || c == 69) { is_float = true; break; }
+        k = k + 1;
+    }
+    if (is_float) {
+        nd.kind = T_FLOAT;
+        nd.s = tok;
+        return nd;
+    }
+    nd.kind = T_INT;
+    nd.i = parse_int(tok);
+    return nd;
+}
+
+fn p_value() TVal {
+    skip_ws();
+    if (eof()) {
+        var nd: TVal;
+        set_err("toml: 意外 EOF（期望值）");
+        return nd;
+    }
+    var c: u8 = peek();
+    if (c == 34) { return p_string(false); }
+    if (c == 39) {
+        if (peek2() == 39 && g_src[g_pos + 2] == 39) { return p_literal(true); }
+        return p_literal(false);
+    }
+    // 数组由主循环用 p_array_to 直接落库，这里不处理 '['
+    return p_scalar();
+}
+
+// 把「点分键段」解析为（表路径, 键），结果存入 g_tp / g_tk。
+fn resolve_target(key_segs: []string) void {
+    var tpath: string = g_cur_path;
+    var n: u64 = slice_len(key_segs) as u64;
+    var i: u64 = 0;
+    while (i + 1 < n) {
+        if (str_len(tpath) == 0) { tpath = key_segs[i]; }
+        else {
+            var sb: StringBuilder = sb_new();
+            sb_append_str(sb, tpath);
+            sb_append_char(sb, 46);          // '.'
+            sb_append_str(sb, key_segs[i]);
+            tpath = sb_to_str(sb);
+        }
+        i = i + 1;
+    }
+    g_tp = tpath;
+    g_tk = key_segs[n - 1];
+}
+
+// 直接在 g_strs 中写入数组元素：键 = lk(tpath,key) + "\t" + idx。
+// ⚠ 不经由 []string / 结构体字段（t 编译器对切片作字段/映射值会崩溃）。
+fn p_array_to(tpath: string, key: string) void {
+    var lkey: string = lk(tpath, key);
+    g_pos = g_pos + 1;                      // '['
+    var idx: i64 = 0;
+    while (eof() == false) {
+        skip_ws();
+        if (eof()) { break; }
+        var c: u8 = peek();
+        if (c == 10) { g_pos = g_pos + 1; continue; }
+        if (c == 13) { g_pos = g_pos + 1; continue; }
+        if (c == 44) { g_pos = g_pos + 1; continue; }
+        if (c == 93) { g_pos = g_pos + 1; return; }
+        var v: TVal = p_value();
+        var ek: StringBuilder = sb_new();
+        sb_append_str(ek, lkey);
+        sb_append_char(ek, 9);              // '\t'
+        sb_append_str(ek, int_to_str(idx));
+        if (v.kind == T_STR) { g_strs[sb_to_str(ek)] = v.s; }
+        else { g_strs[sb_to_str(ek)] = "(?)"; }
+        idx = idx + 1;
+    }
+    set_err("toml: 未闭合的数组");
+}
+
+// ── 键解析 ───────────────────────────────────────────────────
+fn p_one_key() string {
+    skip_ws();
+    var c: u8 = peek();
+    if (c == 34) { var nd: TVal = p_string(false); return nd.s; }
+    if (c == 39) { var nd: TVal = p_literal(false); return nd.s; }
+    var sb: StringBuilder = sb_new();
+    while (eof() == false) {
+        var ch: u8 = peek();
+        if ((ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) ||
+            (ch >= 48 && ch <= 57) || ch == 95 || ch == 45) {
+            sb_append_char(sb, ch);
+            g_pos = g_pos + 1;
+        } else { break; }
+    }
+    return sb_to_str(sb);
+}
+
+fn p_dotted_key() []string {
+    var segs: []string = [];
+    while (true) {
+        var k: string = p_one_key();
+        append(segs, k);
+        skip_ws();
+        if (eof() || peek() != 46) { break; }
+        g_pos = g_pos + 1;
+    }
+    return segs;
+}
+
+// 把标量解析值写入当前表路径下的 key（点分键嵌套由 resolve_target 处理）
+fn put_value(key_segs: []string, val: TVal) void {
+    resolve_target(key_segs);
+    var lkey: string = lk(g_tp, g_tk);
+    if (val.kind == T_STR) { g_strs[lkey] = val.s; }
+    else if (val.kind == T_INT) { g_ints[lkey] = val.i; }
+    else if (val.kind == T_BOOL) { g_bools[lkey] = val.b; }
+    else if (val.kind == T_FLOAT) { g_floats[lkey] = val.s; }
+}
+
+// ── 表头解析 ─────────────────────────────────────────────────
+fn p_table_header() void {
+    var is_arr: bool = false;
+    g_pos = g_pos + 1;                      // 第一个 '['
+    if (eof() == false && peek() == 91) { is_arr = true; g_pos = g_pos + 1; }
+    var raw: StringBuilder = sb_new();
+    while (eof() == false) {
+        var c: u8 = peek();
+        if (c == 93) { break; }
+        sb_append_char(raw, c);
+        g_pos = g_pos + 1;
+    }
+    if (eof()) { set_err("toml: 未闭合的表头"); return; }
+    g_pos = g_pos + 1;
+    if (is_arr) {
+        if (eof() == false && peek() == 93) { g_pos = g_pos + 1; }
+        else { set_err("toml: 数组表头应以 ']]' 结束"); }
+    }
+    var raws: string = sb_to_str(raw);
+    var path: string = normalize_path(raws);
+    if (str_len(path) == 0) { return; }
+    if (is_arr) {
+        // [[a.b.c]]：在 a.b.c 下追加一个数组元素表，cur 指向新元素
+        var idx: i64 = 0;
+        var aidxkey: string = int_to_str(g_doc_id) + "\t" + path;
+        if (map_has(g_arr_idx, aidxkey)) { idx = g_arr_idx[aidxkey]; }
+        g_arr_idx[aidxkey] = idx + 1;
+        mark_table(path);                   // 容器本身是表（数组）
+        // 新元素路径：path + "[" + idx + "]"
+        var sb: StringBuilder = sb_new();
+        sb_append_str(sb, path);
+        sb_append_char(sb, 91);             // '['
+        sb_append_str(sb, int_to_str(idx));
+        sb_append_char(sb, 93);             // ']'
+        g_cur_path = sb_to_str(sb);
+    } else {
+        mark_table(path);
+        g_cur_path = path;
+    }
+}
+
+// 把 "a.b.c" 或 "a.b.c  " 规整为点分段路径（去空白）
+fn normalize_path(s: string) string {
+    var sb: StringBuilder = sb_new();
+    var n: u64 = str_len(s);
+    var i: u64 = 0;
+    var have: bool = false;
+    while (i < n) {
+        var c: u8 = s[i];
+        if (c == 32 || c == 9) {
+            // 跳过段间空白
+        } else if (c == 46) {
+            sb_append_char(sb, 46);
+            have = true;
+        } else {
+            sb_append_char(sb, c);
+            have = true;
+        }
+        i = i + 1;
+    }
+    return sb_to_str(sb);
+}
+
+// ── 入口 ─────────────────────────────────────────────────────
+// 返回本文档的 doc id（供访问器区分不同清单）。所有键以该 id 为前缀，
+// 故可先解析主清单、再逐个解析依赖清单而互不覆盖。
+pub fn parse_toml(src: string) i64 {
+    g_doc_seq = g_doc_seq + 1;
+    g_doc_id = g_doc_seq;
+    g_src = src;
+    g_len = str_len(src);
+    g_pos = 0;
+    g_err = "";
+    if (g_inited == false) { init_globals(); g_inited = true; }
+    g_cur_path = "";
+    while (g_pos < g_len) {
+        skip_ws();
+        if (g_pos >= g_len) { break; }
+        var c: u8 = peek();
+        if (c == 10) { g_pos = g_pos + 1; continue; }
+        if (c == 13) { g_pos = g_pos + 1; continue; }
+        if (c == 35) { skip_line(); continue; }
+        if (c == 91) {
+            p_table_header();
+            skip_line();
+            continue;
+        }
+        var segs: []string = p_dotted_key();
+        skip_ws();
+        if (g_pos >= g_len || peek() != 61) {
+            var lo: u64 = 0;
+            if (g_pos > 20) { lo = g_pos - 20; }
+            var ctx: string = str_slice(g_src, lo, g_pos);
+            set_err("toml: 期望 '='，上下文: ..." + ctx);
+            skip_line();
+            continue;
+        }
+        g_pos = g_pos + 1;
+        skip_ws();
+        if (peek() == 91) {
+            // 数组值：直接落库（不经由切片字段/映射值）
+            resolve_target(segs);
+            p_array_to(g_tp, g_tk);
+        } else {
+            var value: TVal = p_value();
+            put_value(segs, value);
+        }
+        skip_line();
+    }
+    return g_doc_id;
+}
+
+// ── 访问器（供 tote 使用）────────────────────────────────────
+// doc 为 parse_toml 返回的文档 id；访问器先重置 g_doc_id 再读，故读取不受
+// 后续 parse_toml 调用的覆盖影响。
+pub fn get_str(doc: i64, table_path: string, key: string, def: string) string {
+    g_doc_id = doc;
+    var lkey: string = lk(table_path, key);
+    if (map_has(g_strs, lkey)) { return g_strs[lkey]; }
+    if (map_has(g_floats, lkey)) { return g_floats[lkey]; }
+    return def;
+}
+
+pub fn get_int(doc: i64, table_path: string, key: string, def: i64) i64 {
+    g_doc_id = doc;
+    var lkey: string = lk(table_path, key);
+    if (map_has(g_ints, lkey)) { return g_ints[lkey]; }
+    if (map_has(g_floats, lkey)) { return parse_int(g_floats[lkey]); }
+    return def;
+}
+
+pub fn get_bool(doc: i64, table_path: string, key: string, def: bool) bool {
+    g_doc_id = doc;
+    var lkey: string = lk(table_path, key);
+    if (map_has(g_bools, lkey)) { return g_bools[lkey]; }
+    return def;
+}
+
+pub fn get_float(doc: i64, table_path: string, key: string, def: f64) f64 {
+    g_doc_id = doc;
+    var lkey: string = lk(table_path, key);
+    if (map_has(g_floats, lkey)) { return parse_f64(g_floats[lkey]); }
+    if (map_has(g_ints, lkey)) { return (g_ints[lkey] as f64); }
+    return def;
+}
+
+// 取某表下的「字符串值子项」填入 out（用于遍历 [dependencies] 等）。
+// out 为调用方提供的 map[string]string，直接填充（map 为引用类型）。
+pub fn get_table_strs(doc: i64, table_path: string, out: map[string]string) void {
+    g_doc_id = doc;
+    // 前缀： "<docid>\t<tablepath>\t"（顶层 table_path="" 时为 "<docid>\t"）
+    var prefix: string;
+    if (str_len(table_path) > 0) {
+        prefix = int_to_str(g_doc_id) + "\t" + table_path + "\t";
+    } else {
+        prefix = int_to_str(g_doc_id) + "\t";
+    }
+    var pfx: u64 = str_len(prefix);
+    // 遍历 g_strs 中所有以 prefix 开头的键
+    for (k in g_strs) {
+        var kl: u64 = str_len(k);
+        if (kl < pfx) { continue; }
+        // 比较前缀
+        var ok: bool = true;
+        var j: u64 = 0;
+        while (j < pfx) {
+            if (k[j] != prefix[j]) { ok = false; break; }
+            j = j + 1;
+        }
+        if (ok == false) { continue; }
+        var child: string = str_slice(k, pfx, kl);
+        // 子键不应再含 '\t'（即只是本表直接子项，不是深层嵌套）
+        var has_tab: bool = false;
+        var ci: u64 = 0;
+        var cl: u64 = str_len(child);
+        while (ci < cl) {
+            if (child[ci] == 9) { has_tab = true; break; }
+            ci = ci + 1;
+        }
+        if (has_tab) { continue; }
+        out[child] = g_strs[k];
+    }
+}
+
+// 列出 path 的「直接子表名」集合，写入 out: map[string]bool。
+// 用于枚举 [dependencies.foo] / [dependencies.bar] 这类子表（dep 名 = 子表名）。
+// ⚠ 用 out 形参（map）回填，避免 []string 返回值的代码生成坑。
+pub fn get_child_tables(doc: i64, path: string, out: map[string]bool) void {
+    g_doc_id = doc;
+    var prefix: string = int_to_str(g_doc_id) + "\t" + path + ".";   // 表路径.
+    var plen: u64 = str_len(prefix);
+    for (k in g_tables) {
+        var kl: u64 = str_len(k);
+        if (kl <= plen) { continue; }
+        var ok: bool = true;
+        var j: u64 = 0;
+        while (j < plen) {
+            if (k[j] != prefix[j]) { ok = false; break; }
+            j = j + 1;
+        }
+        if (ok == false) { continue; }
+        var rest: string = str_slice(k, plen, kl);
+        // 子表名不应再含 '.'（只取直接子表，不取孙表）
+        var has_dot: bool = false;
+        var ri: u64 = 0;
+        var rl: u64 = str_len(rest);
+        while (ri < rl) {
+            if (rest[ri] == 46) { has_dot = true; break; }
+            ri = ri + 1;
+        }
+        if (has_dot == false) { out[rest] = true; }
+    }
+}
+
+// ⚠ t 编译器对 []string 的「映射值 / 结构体字段 / 作为参数 append 后回传」均存在缺陷，
+//    故数组对外 API 不返回 []string，而用「长度 + 按下标取元素」两个标量接口。
+// 数组元素在内部以「lk(table_path,key) + "\t" + idx」为键存入 g_strs。
+
+// 数组长度（元素个数）。
+pub fn get_arr_len(doc: i64, table_path: string, key: string) i64 {
+    g_doc_id = doc;
+    var lkey: string = lk(table_path, key);
+    var idx: i64 = 0;
+    while (true) {
+        var ek: StringBuilder = sb_new();
+        sb_append_str(ek, lkey);
+        sb_append_char(ek, 9);              // '\t'
+        sb_append_str(ek, int_to_str(idx));
+        if (map_has(g_strs, sb_to_str(ek)) == false) { break; }
+        idx = idx + 1;
+    }
+    return idx;
+}
+
+// 取数组第 idx 个元素（越界 / 不存在则返回 ""）。
+pub fn get_arr_str(doc: i64, table_path: string, key: string, idx: i64) string {
+    g_doc_id = doc;
+    var lkey: string = lk(table_path, key);
+    var ek: StringBuilder = sb_new();
+    sb_append_str(ek, lkey);
+    sb_append_char(ek, 9);                  // '\t'
+    sb_append_str(ek, int_to_str(idx));
+    var ek2: string = sb_to_str(ek);
+    if (map_has(g_strs, ek2)) { return g_strs[ek2]; }
+    return "";
+}
+
+pub fn err_msg() string {
+    return g_err;
+}
