@@ -1,0 +1,5 @@
+@module(pub)
+
+extend overload fn op(0, b: i64) i64 {
+    return b * 100;
+}

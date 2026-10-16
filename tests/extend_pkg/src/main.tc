@@ -1,0 +1,7 @@
+@import("base")
+
+fn main() i32 @main {
+    println("op(0,5)=" + int_to_str(base.op(0, 5)));
+    println("op(2,3)=" + int_to_str(base.op(2, 3)));
+    return 0;
+}

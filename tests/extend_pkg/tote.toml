@@ -1,0 +1,10 @@
+[package]
+name = "app"
+version = "0.1.0"
+entry = "src/main.tc"
+
+[dependencies.base]
+path = "./libs/base"
+
+[dependencies.ext]
+path = "./libs/ext"

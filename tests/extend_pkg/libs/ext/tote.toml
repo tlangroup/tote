@@ -1,0 +1,4 @@
+[package]
+name = "ext"
+version = "1.0.0"
+entry = "src/ext.tc"

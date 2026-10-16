@@ -12,18 +12,23 @@
 - 这是一个 **tc ↔ tote 协作特性**；tote 侧接缝已就位，硬骨头在 tc 侧（跨文件 `extend overload` 解析
   + `--emit-deps` 输出 `extended_by` 边 + `build --lib` 多文件入口）。
 
-### 实施状态（2026-10-15 更新）
+### 实施状态（2026-10-16 更新）
 
-- ✅ **阶段 1（tote 能力）已落地**：`sys_capture` / `parse_extend_edges` / `load_extend_graph` /
-  `transitive_closure` / `sorted_keys` 已加入 `src/tote.tc`。
-- ✅ **阶段 2（tote 接线）已落地**：`process_dep` 在复制 entry 后、`key_of` 之前调用
-  `load_extend_graph`；`tc build --lib` 命令按「传递闭包」拼装多文件单元。
-- ✅ **阶段 4（回归）已验证**：无 extend 普通工程路径**零行为变化**——用 git HEAD 原始 `tote.tc`
-  编出基线二进制与改动后二进制，在同一 fixture 上冷构建 / 热构建 / 运行的日志、`tote.lock`、
-  `app.ll`、以及全部缓存键**逐字节一致**。
-- ⏸ **阶段 3（端到端验证）BLOCKED on tc**：需 REQ-EXT-1/2/3 就位（见 §5）后才能构造
-  §6 fixture 验证级联重建。
-- 当前 MVP（无 extend）路径不受影响：tc 今日不输出 `kind:"extend"`，`g_extend_by` 恒为空表，
+- ✅ **阶段 1（tote 能力）已落地**：`scan_overload_targets` / `scan_extend_targets` /
+  `register_extend_edge` / `load_full_graph`（静态源码分析）/ `transitive_closure` / `sorted_keys`
+  已加入 `src/tote.tc`。
+- ✅ **阶段 2（tote 接线）已落地**：两趟拆分——`Pass 1`（`resolve_all_deps` + `load_full_graph`
+  静态分析建图）与 `Pass 2`（`build_unit` 按拓扑序构建，被吸收单元跳过独立 `.tlib`）。
+- ✅ **阶段 3（端到端验证）已通过**：`tests/extend_pkg` fixture 冷构建 / 改 ext 重建 /
+  改 base 重建 / 全量缓存复用 全部正确（详见 §6 实测结论）。
+- ✅ **阶段 4（回归）已验证**：无 extend 普通工程路径**零行为变化**——`tests/fixture` 冷构建
+  输出 `foo_add=12 / bar_id=7 / baz_val=100`，热构建全量复用，改 bar 级联重建 foo+app、baz 复用。
+- ⚠ **关键工程决策（2026-10-16）**：extend 边**不再依赖 tc `--emit-deps`**。实测证伪原假设——
+  tc 的 `check --emit-deps` 在（合并或单文件）单元上均只输出 import 边，跨文件 extend 边任何
+  场景都报不出（`emit_deps` 需被扩展 overload 组已进入当前单元 decl_list 才能匹配，而 per-unit
+  探测时扩展者未把目标拉入同一单元）；且 `build --lib` 不接受 `--emit-deps`。故 tote 改用
+  **Pass 1 静态源码分析**（按 overload 组名匹配扩展者↔被扩展者），零 tc 子进程、忠实于 tc 语义。
+- 当前 MVP（无 extend）路径不受影响：静态扫描无 `overload`/`extend` ⇒ `g_extend_by` 恒空表，
   闭包为空 ⇒ 不追加任何文件、键不变，等价于原逻辑。
 
 ---
@@ -63,47 +68,57 @@
 ## 2. 现状盘点（实证）
 
 ### 2.1 tc 今天有什么
-- `extend overload fn` 语法**仅同文件**生效（Route 1）：parse.tc:2800 起；跨文件引用触发
-  `T-OVL-E980 EXTEND_NO_GROUP`（diag_table.gen.h:116）。
+- 跨文件 `extend overload fn` 解析已接通（REQ-EXT-3 落地）：被扩展模块与扩展模块**同单元**
+  （`tc_load_src` 多文件）时，扩展子句并入被扩展模块的 overload 组，`tc build --lib a.tc b.tc`
+  与单文件拼接语义等价、运行期分发正确（值模式跨 extend 生效；守卫模式 `when cond` 即使同文件
+  也**不**参与运行期分发，故跨文件必须用值模式子句）。
 - 多文件编译单元底座 `tc_load_src(files)`（tc.tc:54）：把多份源码拼接进同一 `decl_list`，
   共享命名空间 → 跨文件同名 overload 子句按名合并。
 - `check` 已支持多文件位置参数（tc.tc:285–291），经 `tc_load_src` 拼装。
 - `--emit-deps`（sema.tc:11068）输出 JSON：`{"entry":..., "edges":[{"from":X,"to":Y}, ...]}`，
-  **仅 import 边，无 `extended_by`**。
+  **仅 import 边**。⚠ **重要**：`check --emit-deps` 在跨文件 extend 场景下**不输出**
+  `kind:"extend"` 边（见 §2.2 实测），`build --lib` 亦不接受 `--emit-deps` 开关。
 
-### 2.2 tc 今天缺什么（核心待提交 tc）
-1. 跨文件 `extend overload fn` 解析（Route 2 的语义接通：在被扩展模块与扩展模块同单元时，
-   把扩展子句并入被扩展模块的 overload 组）。
-2. `--emit-deps` 额外输出 `extended_by` 边（见 §3.1）。
-3. 确认 / 接线 `build --lib` 接受多文件参数（tote 拼装单元时需要）。
+### 2.2 tc 的 emit-deps 局限（实测 · 决定 tote 改用静态分析）
+`emit_deps()`（sema.tc:11081）理论上在「被扩展 overload 组已进入当前单元 decl_list」时会
+输出 `{from:Y, to:X, kind:"extend"}`。但**实测**：
+- `tc check --emit-deps ext.tc`（ext 不 `@import` base）→ `{"edges":[]}`；
+- `tc check --emit-deps base.tc ext.tc`（合并单元仍只给首文件 entry）→ 仍 `{"edges":[]}`；
+- `tc build --lib --emit-deps ...` → 把 `--emit-deps` 当成文件路径报错。
+根因：emit_deps 的 extend 边匹配依赖被扩展组已在本单元 decl_list，而 tote per-unit 探测时
+扩展者并未把目标拉进同一单元，故永远匹配不到。`⇒ tote 不能在 Pass 1 依赖 tc 发现 extend 边`，
+改为 tote 自做静态源码分析（§3 / §4.1）。tc 侧的 REQ-EXT-1（emit-deps 出 extend 边）对 tote
+已非必需。
 
 ### 2.3 tote 今天有什么（接缝已就位）
-- `g_extend_by: map[string]map[string]bool`（tote.tc:264）：单元名 → {扩展它的单元}。
-- `key_of`（tote.tc:322）已在 337–344 行把 `g_extend_by[name]` 闭包源哈希并入单元键。
-- `imports_of`（tote.tc:300）被注释为「输入集合的单一接缝」，extend 落地后在此并入 `extended_by` 闭包。
-- `process_dep`（tote.tc:366）已有 `tc build --lib` 单文件调用骨架（429–441 行）。
+- `g_extend_by: map[string]map[string]bool`：单元名 → {扩展它的单元}（入边）。
+- `g_extends: map[string]map[string]bool`：单元名 → {本单元 extend 的单元}（出边，吸收判定）。
+- `key_of`（tote.tc:328）已把 `transitive_closure(name)` 闭包源哈希并入单元键。
+- `imports_of`（tote.tc:306）仍是「输入集合的单一接缝」。
+- 两趟骨架：`resolve_all_deps` / `load_full_graph`（静态分析建图）/ `build_unit`（拓扑序构建）。
 
-### 2.4 tote 今天缺什么（待补两处）
-1. **从不开 `g_extend_by`**：tote 全程未调用 `tc --emit-deps`，`g_extend_by` 永远空表。
-2. **`process_dep` 只传单入口文件**：未被扩展闭包拼装成多文件单元。
+### 2.4 tote 今天缺什么（已补）
+1. ~~**从不开 `g_extend_by`**~~：已由 `load_full_graph` 的静态分析填充（不依赖 tc `--emit-deps`）。
+2. ~~**`process_dep` 只传单入口文件**~~：已改为两趟，`build_unit` 按 `transitive_closure`
+   拼装多文件单元，被吸收单元跳过独立 `.tlib`。
 
 ---
 
 ## 3. tc ↔ tote 接口契约（核心待提交 tc 的部分）
 
-### 3.1 `--emit-deps` 扩充：新增 `extended_by` 边
-`sema.emit_deps()`（sema.tc:11068）在现有 `edges`（import 边）之外，额外输出 extend 边：
-```json
-{
-  "entry": "out/lib/dbg/foo.tc",
-  "edges": [
-    {"from":"foo", "to":"bar", "kind":"import"},
-    {"from":"baz", "to":"foo", "kind":"extend"}   // baz extend overload 指向 foo 的组
-  ]
-}
-```
-- `from` = 扩展模块单元名；`to` = 被扩展模块单元名；`kind:"extend"` 区分 import 边。
-- 传递闭包由 tote 在 `g_extend_by` 上做闭包求解（§4.1），tc 只给直接边。
+### 3.1 extend 边来源（tote 静态分析，不依赖 tc `--emit-deps`）
+> ⚠ 原设计拟让 tc 的 `--emit-deps` 输出 `extended_by` 边（见旧 §3.1）。**实测该路径在跨文件
+> extend 下取不到边**（§2.2），故 tote 改为静态分析，tc 的 emit-deps 对 tote 已非必需。
+
+tote 在 Pass 1 对 `out/lib/<mode>` 下每个已复制的单元源码做轻量扫描：
+- `overload fn NAME`（前一词非 `extend`）⇒ 该单元「声明」名为 `NAME` 的 overload 组；
+- `extend overload fn NAME` ⇒ 该单元「扩展」名为 `NAME` 的 overload 组。
+把「扩展名 `NAME`」按名匹配到「声明 `NAME` 的其他单元」，即得边
+`{from: 扩展者单元, to: 被扩展单元}`。这与 tc 内部按名合并 overload 组的口径一致（跨文件
+extend 本就是同单元内按名合并），忠实于 tc 语义；纯字符串扫描、零 tc 子进程。
+
+- `from` = 扩展模块单元名；`to` = 被扩展模块单元名。
+- 传递闭包由 tote 在 `g_extend_by` 上做闭包求解（§4.1），静态分析只给直接边。
 
 ### 3.2 多文件编译单元入口
 `tote` 把「被扩展模块 + 其扩展闭包」按 `tc build --lib` 的**多个位置参数**传入：
@@ -123,28 +138,32 @@ tc build --lib --mode <m> --output out/lib/<m>/<name> --lib-dir out/lib/<m> \
 
 ## 4. tote 侧待补两处接线（具体改动 + 伪代码）
 
-### 4.1 填充 `g_extend_by`（新增 `load_extend_graph`）
-在 `cmd_build_or_run` / `cmd_check` 解析完主清单、进入依赖遍历**之前**调用一次：
+### 4.1 填充 `g_extend_by`（Pass 1 静态分析 · `load_full_graph`）
+在两趟的 Pass 1 内、`cmd_build_or_run` / `cmd_check` 解析完主清单、复制全部 entry 到 libdir
+**之后**、进入任何构建**之前**调用一次：
 
 ```t
-// 对某个已复制到 libdir 的单元，跑 tc --emit-deps 取边，并入 g_extend_by / dep_path(import)。
-fn load_extend_graph(name: string) void {
-    var f: string = str_concat5(g_libdir, "/", name, ".tc", "");
-    if (path_exists(f) == false) { return; }
-    var cmd = "\"<tc>\" check --emit-deps --lib-dir \"<libdir>\" \"<f>\"";
-    var out: string = sys_capture(cmd);          // 需新增：取 stdout（tote 现有 sys_run 只返 rc）
-    // JSON 极简解析：扫 {"from":"X","to":"Y","kind":"extend"} 片段
-    for each edge in parse_edges(out):
-        if edge.kind == "extend":
-            if (map_has(g_extend_by, edge.to) == false) { var m: map[string]bool; g_extend_by[edge.to] = m; }
-            g_extend_by[edge.to][edge.from] = true;
-        // import 边可顺手回填 imports_of，但 tote 已自扫 @import，可忽略
+// 对全部已复制到 libdir 的单元做静态分析，建出完整 extend 图（不依赖 tc --emit-deps）。
+fn load_full_graph() void {
+    // 阶段 ①：建「overload 组名 -> {声明该组的单元}」索引 g_decl_units
+    for u in g_all_units:
+        decls = scan_overload_targets(read(libdir/"u.tc"))
+        for nm in decls: g_decl_units[nm][u] = true
+    // 阶段 ②：匹配扩展名到其他声明单元，登记边
+    for u in g_all_units:
+        exts = scan_extend_targets(read(libdir/"u.tc"))
+        for nm in exts:
+            for tv in g_decl_units[nm]:
+                if tv != u: register_extend_edge(u, tv)   // from=u(扩展者) to=tv(被扩展)
 }
 ```
-- **依赖新增**：tote 需一个「捕获子进程 stdout」的能力（现有 `sys_run` 仅返回退出码）。可在 `src/tote.tc`
-  加 `sys_capture(cmd) string`（Windows: `cmd /c <cmd> > tmpfile` 再 `file_read_all`，或直接调运行时）。
-- 调用点：`process_dep` 把 entry 复制到 `libdir/<name>.tc` 之后（tote.tc:417 之后）调用一次
-  `load_extend_graph(name)`，确保 `key_of` 在 423 行算键前 `g_extend_by` 已填。
+- `scan_overload_targets`：找 `overload fn NAME`（前词非 `extend`）。
+- `scan_extend_targets`：找 `extend [pub] overload fn NAME`。
+- `register_extend_edge(from, to)`：同时填 `g_extend_by[to][from]`（入边）与
+  `g_extends[from][to]`（出边，吸收判定），并作废相关缓存键。
+- **零 tc 子进程**：纯字符串扫描，无 extend 的普通工程也无任何开销（扫描无匹配即退出）。
+- 调用点：`resolve_all_deps(doc); load_full_graph();` 之后才进入 `Pass 2` 的 `build_unit` 循环，
+  保证 `key_of` 算键前 `g_extend_by` 已全图填实（根治旧单趟的「已构建产物无法回滚」问题）。
 
 ### 4.2 `process_dep` 多文件拼装
 当 `map_has(g_extend_by, name)` 为真时，把闭包内各单元文件追加到 `tc build --lib` 位置参数：
@@ -165,64 +184,61 @@ if (map_has(g_extend_by, name)) {
 
 ---
 
-## 5. tc 侧待补（请求信箱条目，详见 TC_INTERFACE_REQUESTS.md）
+## 5. tc 侧（与 tote 职责划分）
 
-| 编号 | 需要 tc 改什么 | 建议位置 | 验收标准 |
-|---|---|---|---|
-| REQ-EXT-1 | `--emit-deps` 输出 `extended_by` 边（kind:"extend"） | `sema.emit_deps()`（sema.tc:11068） | `tc check --emit-deps` 对含跨文件 extend 的单元输出 extend 边 |
-| REQ-EXT-2 | `build --lib` 接受多文件位置参数并拼为同一单元 | `tc.tc` build 分支（参考 check 的 285–291 行） | `tc build --lib a.tc b.tc` 与单文件拼接结果语义等价，无 EXTEND_NO_GROUP |
-| REQ-EXT-3 | 跨文件 `extend overload fn` 解析接通（Route 2） | parse/sema 的 overload 合并（`desugar_func_clauses`） | a.tc 声明 overload 组，b.tc `extend overload` 同单元并入，运行期分发正确 |
+| 编号 | 内容 | 状态 |
+|---|---|---|
+| REQ-EXT-1 | `--emit-deps` 输出 `extended_by` 边 | ⚠ **对 tote 已非必需**：实测跨文件 extend 下取不到边（§2.2），tote 改用静态分析 |
+| REQ-EXT-2 | `build --lib` 接受多文件位置参数并拼为同一单元 | ✅ 已落地（`tc build --lib a.tc b.tc` 语义等价） |
+| REQ-EXT-3 | 跨文件 `extend overload fn` 解析接通（Route 2） | ✅ 已落地（值模式跨文件分发正确） |
 
-> 注：REQ-EXT-3 与「编译器变体派生」所需的大 extend（开放类型）不同，此处只是 overload 子句跨文件合并，
-> 工作量显著小于 IR-1。但二者共享 `extend` 关键字与 `tc_load_src` 多文件底座。
-
----
-
-## 6. 验收标准（端到端，待 tc 三项就位后）
-
-1. **构造 fixture**：`foo.tc` 声明 `overload fn op(...)` 组；`bar.tc` `extend overload fn op(...)`。
-2. `tote build`：foo 与 bar 拼为同一单元 → 产出 `foo.tlib`，bar 不产生独立 `.tlib`。
-3. **改 bar 源** → 仅 `key_of(foo)` 失效 → foo 重建、baz（未 extend foo）复用缓存。
-4. **改 foo 源** → foo 自身重建；bar 因被拼入 foo 单元而随之重建。
-5. `tote check` 对同一单元不报 `EXTEND_NO_GROUP`。
+> 注：REQ-EXT-3 与「编译器变体派生」所需的大 extend（开放类型）不同，此处只是 overload 子句跨文件合并。
+> tote 仅依赖 REQ-EXT-2/3（`build --lib` 多文件 + 跨文件 extend 解析）；REQ-EXT-1 因 tote 侧改用
+> 静态分析而不再是 tote 的硬依赖。
 
 ---
 
-## 7. 分阶段落地计划
+## 6. 验收标准（端到端 · 2026-10-16 实测结论：全部通过）
 
-- ⏸ **阶段 0（tc）**：REQ-EXT-1/2/3 由 tc 工程落地（见 TC_INTERFACE_REQUESTS.md 请求信箱）。**未开始**。
-- ✅ **阶段 1（tote 能力）已完成**：已加 `sys_capture` + `parse_extend_edges` + `load_extend_graph` +
-  `transitive_closure` + `sorted_keys`（§4.1/4.2），默认不触发（extend 边为空时与原逻辑一致）。
-- ✅ **阶段 2（tote 接线）已完成**：`process_dep` 复制 entry 后调 `load_extend_graph`（在 `key_of` 之前）；
-  `tc build --lib` 命令按传递闭包拼装多文件。另加「源中无 `extend` 关键字则跳过探测」的前置过滤，
-  使无 extend 的普通工程**不付出任何 tc 子进程开销**。
-- ⏸ **阶段 3（验证）BLOCKED**：待阶段 0 就位后跑 §6 fixture，确认级联重建正确、无误复用。
-- ✅ **阶段 4（回归）已完成**：无 extend 普通工程零行为变化（见 §0 实施状态，逐字节对比验证）。
+fixture：`tests/extend_pkg`
+- `libs/base/src/base.tc`：`pub overload fn op(a,b){a+b}`
+- `libs/ext/src/ext.tc`：`extend overload fn op(0, b: i64) i64 { return b * 100; }`（**值模式**，跨文件分发）
+- `src/main.tc`：`@import("base")`，打印 `op(0,5)` 与 `op(2,3)`
 
-> 阶段 3 还需补一处（§6.2）：「扩展者不再单独产出 `.tlib`」。这要求在任何依赖被构建之前就把
-> extend 图完整加载（即依赖解析与构建拆成两趟），当前 `process_dep` 是「边解析边构建」的单趟结构，
-> 故该条推迟到阶段 3 与真实 extend 边一并处理。
+1. ✅ `tote build`：base 与 ext 拼为同一单元 → 产出 `base.tlib`，ext **不产出**独立 `.tlib`（被吸收）。
+2. ✅ 运行：`op(0,5)=500`（ext 值模式子句）、`op(2,3)=5`（base 子句）——跨文件 extend 合并 + 运行期分发正确。
+3. ✅ **改 ext 源** → `key_of(base)` 失效（闭包含 ext 源）→ base 重建（折叠新 ext）、main 重建；baz 类无关单元若存则复用。
+4. ✅ **改 base 源** → base 自身重建（仍折叠 ext）；main 随之重建。
+5. ✅ **未改动时全量复用**：BUILD#2 全部命中缓存键，无任何 tc 调用。
+6. ✅ **非 extend 回归**（`tests/fixture`）：冷构建 `foo_add=12/bar_id=7/baz_val=100`，热构建全量复用，
+   改 bar 级联重建 foo+app、baz 复用——零行为变化。
+
+---
+
+## 7. 分阶段落地计划（2026-10-16 全部完成）
+
+- ✅ **阶段 0（tc）**：REQ-EXT-2/3 落地；REQ-EXT-1 经实测证伪「tote 可用」，tote 改静态分析。
+- ✅ **阶段 1（tote 能力）已完成**：`scan_overload_targets` + `scan_extend_targets` + `register_extend_edge`
+  + `load_full_graph`（静态分析）+ `transitive_closure` + `sorted_keys`，无 extend 时零开销。
+- ✅ **阶段 2（tote 接线）已完成**：两趟拆分——`Pass 1`（`resolve_all_deps` + `load_full_graph` 建图）
+  与 `Pass 2`（`build_unit` 拓扑序构建，被吸收单元跳过独立 `.tlib`，`tc build --lib` 按传递闭包多文件拼装）。
+- ✅ **阶段 3（验证）已完成**：§6 fixture 级联重建、吸收、运行期分发全部正确。
+- ✅ **阶段 4（回归）已完成**：无 extend 普通工程零行为变化（`tests/fixture` 验证）。
 
 ---
 
 ## 8. 风险 / 未决
 
-- **extend 环（已决 · 无环）**：`extend` 粒度限定为函数与数据结构（§1.1）。每条 extend 边 A→B 必伴随
-  import 边 A→B（目标须先 import 入 scope）；t 的 import 图为 DAG（拒绝 `T-MOD-E551` 循环依赖，
-  sema.tc:10823-10840），故 extend 图 ⊆ import 图 ⇒ 无环。tote 的 `transitive_closure` 只需 visited
-  去重，**不实现环检测**。此无环性由 t 的 import 环检测保证，与 tote 包级 resolver 是否为 DAG 无关。
-- **诊断溯源**：`tc_load_src` 多文件时诊断 `file` 统一指向首文件（tc.tc:53 注释），extend 报错时
-  行号对应扩展模块可能不准——需 tc 在 R2 下完善 `g_file` 溯源（非 tote 阻塞项）。
-- **确定性**：多文件拼接顺序必须稳定（被扩展模块恒为首），否则内容哈希抖动。当前约定被扩展模块为
-  单元名且排第一，已稳定。
-- **与变体派生的关系**：本设计仅解决「同一工程内被依赖库的跨文件 extend 缓存」，不涉及 `tc'` 派生；
-  二者在 `[compiler].extend` 引入后再统一考量。
-- ⚠ **`sys_capture` 的 cmd 引号陷阱（已踩坑 · 已修复）**：`t_system`（`runtime/t_runtime.c`）对
-  **以引号开头**的命令串会【自动再包一层引号】以绕开 cmd.exe 的引号剥离怪癖。因此捕获 stdout 时
-  **绝不能自己再加 `cmd /c ` 前缀**——否则变成 cmd 套 cmd、引号被二次剥离，程序路径被破坏、
-  子进程起不来，而 stderr 又被 `2>nul` 吞掉，最终表现为「静默捕获到 0 字节」，整条链路看似正常实则已死。
-  正确写法：把「命令 + `> tmp`」直接交给 `sys_run`，由 `t_system` 统一处理。
-- **探测顺序的边界**：`load_extend_graph(X)` 只能得知「X 自己 extend 了谁」（X 的出边）。若扩展者 Y
-  在被扩展者 X **之后**才被处理，`key_of(X)` 可能已先算完并命中缓存。代码已对新发现的边做
-  `map_del(g_key_cache, to)` 失效处理，但**已构建完成的产物无法回滚**。彻底解法是把「解析/加载图」
-  与「构建」拆成两趟（即阶段 3 的 §6.2 改造），当前因 extend 边恒空而不触发。
+- **extend 环（已决 · 无环）**：`extend` 粒度限定为函数与数据结构（§1.1）。`transitive_closure`
+  只需 visited 去重，**不实现环检测**。若真出现 t 层未被拦住的 extend 环，tc 自身 build 会报错，
+  属可接受的非阻塞项。
+- **诊断溯源**：`tc_load_src` 多文件时诊断 `file` 统一指向首文件，extend 报错行号可能不准——tc 侧完善项（非 tote 阻塞）。
+- **确定性**：多文件拼接顺序稳定（被扩展模块恒为首，闭包按名升序追加），内容哈希不抖动。
+- **与变体派生的关系**：本设计仅解决「同一工程内被依赖库的跨文件 extend 缓存」，不涉及 `tc'` 派生。
+- ⚠ **静态分析按名匹配的限制（已知近似）**：`scan_extend_targets` 把扩展名按 overload 组**名**
+  匹配到「声明该名的其他单元」。若不同模块声明了**同名** overload 组，扩展者可能被折叠进错误单元。
+  overload 组名按惯例模块内唯一，MVP 下可接受；后续如需精确，可再结合 tc 的单元归属信息（届时
+  REQ-EXT-1 的 emit-deps 边反而可作为精确来源）。
+- **守卫模式不分发（跨文件须用值模式）**：t 的 overload 守卫（`when cond`）即使同文件也不参与运行期
+  分发，跨文件 extend 必须用**值模式**子句（如 `extend overload fn op(0, b: i64)`）才能触发分发。
+  fixture 已据此采用值模式；若用户误用守卫模式，运行期会静默走首声明子句，属 t 语言语义，非 tote bug。

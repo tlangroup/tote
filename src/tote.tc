@@ -261,11 +261,19 @@ fn fetch_git(name: string, url: string, rev: string) string {
 
 var g_key_cache:  map[string]u64;          // 单元名 -> 已算出的键
 var g_main_entry: string;                  // 主程序入口路径（key_of 用）
-var g_extend_by:  map[string]map[string]bool; // 单元名 -> {扩展它的单元}（待 tc 提供）
+var g_extend_by:  map[string]map[string]bool; // 单元名 -> {扩展它的单元}（入边）
+var g_extends:    map[string]map[string]bool; // 单元名 -> {本单元 extend 的单元}（出边）
+var g_all_units:  []string;                // 全部依赖单元名（Pass 1 收集，Pass 2 构建）
+var g_unit_seen:  map[string]bool;         // 单元名去重（Pass 1 解析用）
+var g_decl_units: map[string]map[string]bool; // overload 组名 -> {声明该组的单元}（静态分析索引）
 
 fn init_keys() void {
-    var a: map[string]u64;             g_key_cache = a;
-    var b: map[string]map[string]bool; g_extend_by = b;
+    var a: map[string]u64;               g_key_cache  = a;
+    var b: map[string]map[string]bool;   g_extend_by = b;
+    var c: map[string]map[string]bool;   g_extends   = c;
+    var u: []string;                     g_all_units = u;
+    var s: map[string]bool;              g_unit_seen = s;
+    var d: map[string]map[string]bool;   g_decl_units = d;
     g_main_entry = "";
 }
 
@@ -369,13 +377,21 @@ fn write_key(path: string, key: u64) void {
 }
 
 // ────────────────────────────────────────────────────────────────
-// extend 图支持（设计 docs/design/extend-incremental-cache.md §7 阶段 1「tote 能力」）
+// extend 图支持（Pass 1 静态源码分析，不依赖 tc --emit-deps）
 //
-// ⚠ 当前 tc 的 --emit-deps 只输出 import 边（{"from":X,"to":Y}，无 kind 字段），
-//   故解析后 g_extend_by 恒为空表 ⇒ 传递闭包为空 ⇒ 多文件拼装不追加任何文件、
-//   键也不变，与原逻辑逐字节一致（「默认不触发」）。
-//   tc 落地 REQ-EXT-1（额外输出 {"from":Y,"to":X,"kind":"extend"}）后本段自动生效，
-//   缓存主体无需再改。
+// ⚠ 关键事实（实测）：tc 的 `check --emit-deps` 在（合并或单文件）单元上
+//   均只输出 import 边，跨文件 extend 边（kind:"extend"）在任何场景都报不出
+//   —— 被扩展的 overload 组必须进入「当前单元」的 decl_list 才能被 emit_deps
+//   按名匹配到，而 per-unit 探测时扩展者并未把目标拉进同一单元。且 `build --lib`
+//   不接受 `--emit-deps`。⇒ tote 不能在 Pass 1 依赖 tc 发现 extend 边。
+//
+// 解法：tote 自己做**轻量静态分析**——扫描 libdir 中每个单元的源码：
+//   • `overload fn NAME`（前一词非 `extend`）⇒ 该单元「声明」了名为 NAME 的 overload 组；
+//   • `extend overload fn NAME` ⇒ 该单元「扩展」了名为 NAME 的 overload 组。
+//   把「扩展名 NAME」按名匹配到「声明 NAME 的其他单元」，即得 extend 边
+//   {from: 扩展者单元, to: 被扩展单元}。这与 tc 内部按名合并 overload 组的口径
+//   完全一致（t 的跨文件 extend 本就是「同单元内按名合并」），故忠实于 tc 语义。
+//   纯字符串扫描、零 tc 子进程；无 extend 的普通工程也不付出任何开销。
 // ────────────────────────────────────────────────────────────────
 
 // 字节序字符串小于（确定性排序用）
@@ -392,88 +408,178 @@ fn str_lt(a: string, b: string) bool {
     return na < nb;
 }
 
-// 从 JSON 对象片段取 "key" 的字符串值（极简扫描，够用即可）
-fn json_get_str(obj: string, key: string) string {
-    var pat: string = str_concat3("\"", key, "\"");
-    var p: i64 = str_find(obj, pat, 0);
-    if (p < 0) { return ""; }
-    var n: u64 = str_len(obj);
-    var i: u64 = (p as u64) + str_len(pat);
-    while (i < n && obj[i] != 58) { i = i + 1; }       // ':'
-    if (i >= n) { return ""; }
-    i = i + 1;
-    while (i < n && obj[i] != 34) { i = i + 1; }       // 起始 '"'
-    if (i >= n) { return ""; }
-    i = i + 1;
-    var bld: StringBuilder = sb_new();
-    while (i < n && obj[i] != 34) { sb_append_char(bld, obj[i]); i = i + 1; }
-    return sb_to_str(bld);
+fn is_ident_char(c: i32) bool {
+    if (c >= 97 && c <= 122) { return true; }   // a-z
+    if (c >= 65 && c <= 90)  { return true; }   // A-Z
+    if (c >= 48 && c <= 57)  { return true; }   // 0-9
+    if (c == 95) { return true; }               // '_'
+    return false;
 }
 
-// 捕获子进程 stdout（sys_run 只返回退出码，故重定向到临时文件再读回）
-//
-// ⚠ 绝不能自己加 "cmd /c " 前缀：t_system（runtime/t_runtime.c）对「以引号开头」
-//   的整串命令会【自动再包一层引号】来绕开 cmd.exe 的引号剥离怪癖。若此处再手工
-//   加 cmd /c，就会变成 cmd 套 cmd、引号被二次剥离，程序路径被破坏 → 子进程起不来、
-//   stderr 又被 2>nul 吞掉，最终表现为「静默捕获到 0 字节」（曾实测踩坑）。
-//   正确做法：直接把「命令 + 重定向」交给 sys_run，由 t_system 统一处理。
-fn sys_capture(cmd: string) string {
-    var tmp: string = str_concat2(g_libdir, "/.tote_emit_deps.json");
-    var full: string = str_concat4(cmd, " > \"", to_bs(tmp), "\" 2>nul");
-    sys_run(full);
-    if (path_exists(tmp) == false) { return ""; }
-    return file_read_all(tmp);
+// 从 pos 起读取一个标识符，返回该标识符（pos 必须是标识符首字符）。
+fn ident_at(src: string, pos: u64) string {
+    var n: u64 = str_len(src);
+    var i: u64 = pos;
+    while (i < n && is_ident_char(src[i] as i32)) { i = i + 1; }
+    return str_slice(src, pos, i);
 }
 
-// 解析 --emit-deps 的 JSON：{from:Y, to:X, kind:"extend"} ⇒ Y extend 了 X
-// ⇒ g_extend_by[X][Y] = true（X 是被扩展者，Y 是扩展者）。
-// 只认 kind=="extend"；tc 今日不输出该字段 ⇒ 恒为空表。
-fn parse_extend_edges(js: string) void {
-    var n: u64 = str_len(js);
-    var i: u64 = 0;
+// 返回 before 之前一个 token 的起始下标（before = 目标 token 首字符的下标）；无则 -1。
+fn prev_token_start(src: string, before: u64) i64 {
+    var i: i64 = (before as i64) - 1;
+    var n: u64 = str_len(src);
+    while (i >= 0) {
+        var c: i32 = src[i as u64] as i32;
+        if (c == 32 || c == 9 || c == 10 || c == 13) { i = i - 1; }
+        else { break; }
+    }
+    if (i < 0) { return -1; }
+    var end: i64 = i;
+    while (i >= 0 && is_ident_char(src[i as u64] as i32)) { i = i - 1; }
+    return i + 1;
+}
+
+// 从 "overload" 的起始下标 ovpos 起，跳过 "overload"+空白+"fn"+空白后读取组名；
+// 若形态不符返回 ""。
+fn extract_overload_name(src: string, ovpos: u64) string {
+    var n: u64 = str_len(src);
+    var i: u64 = ovpos + 8;   // 跳过 "overload"
     while (i < n) {
-        if (js[i] != 123) { i = i + 1; continue; }     // 找 '{'
-        var j: u64 = i + 1;
-        while (j < n && js[j] != 125) { j = j + 1; }   // 到 '}'
-        var obj: string = str_slice(js, i, j);
-        if (json_get_str(obj, "kind") == "extend") {
-            var from: string = json_get_str(obj, "from");
-            var to: string = json_get_str(obj, "to");
-            if (str_len(from) > 0 && str_len(to) > 0) {
-                if (map_has(g_extend_by, to) == false) {
-                    var nm: map[string]bool; g_extend_by[to] = nm;
+        var c: i32 = src[i] as i32;
+        if (c == 32 || c == 9 || c == 10 || c == 13) { i = i + 1; }
+        else { break; }
+    }
+    if (i + 2 > n) { return ""; }
+    if (src[i] == 102 && src[i + 1] == 110) {   // "fn"
+        i = i + 2;
+        while (i < n) {
+            var c: i32 = src[i] as i32;
+            if (c == 32 || c == 9 || c == 10 || c == 13) { i = i + 1; }
+            else { break; }
+        }
+        var start: u64 = i;
+        while (i < n && is_ident_char(src[i] as i32)) { i = i + 1; }
+        if (i > start) { return str_slice(src, start, i); }
+    }
+    return "";
+}
+
+// ovpos 处的 "overload" 是否为 `extend [pub] overload fn`（即扩展声明）。
+fn is_extender_at(src: string, ovpos: u64) bool {
+    var s1: i64 = prev_token_start(src, ovpos);
+    if (s1 < 0) { return false; }
+    var w1: string = ident_at(src, s1 as u64);
+    if (w1 == "extend") { return true; }
+    if (w1 == "pub") {
+        var s2: i64 = prev_token_start(src, s1 as u64);
+        if (s2 >= 0 && ident_at(src, s2 as u64) == "extend") { return true; }
+    }
+    return false;
+}
+
+// 本单元源码中「声明」的 overload 组名集合（overload fn NAME，前词非 extend）。
+fn scan_overload_targets(src: string) map[string]bool {
+    var m: map[string]bool;
+    var pos: u64 = 0;
+    while (true) {
+        var p: i64 = str_find(src, "overload", pos);
+        if (p < 0) { break; }
+        var np: u64 = p as u64;
+        if (is_extender_at(src, np)) { pos = np + 8; continue; }
+        var nm: string = extract_overload_name(src, np);
+        if (str_len(nm) > 0) { m[nm] = true; }
+        pos = np + 8;
+    }
+    return m;
+}
+
+// 本单元源码中「扩展」的 overload 组名集合（extend overload fn NAME）。
+fn scan_extend_targets(src: string) map[string]bool {
+    var m: map[string]bool;
+    var pos: u64 = 0;
+    while (true) {
+        var p: i64 = str_find(src, "extend", pos);
+        if (p < 0) { break; }
+        var np: u64 = p as u64;
+        var after: u64 = np + 7;   // 跳过 "extend"
+        var n: u64 = str_len(src);
+        while (after < n) {
+            var c: i32 = src[after] as i32;
+            if (c == 32 || c == 9 || c == 10 || c == 13) { after = after + 1; }
+            else { break; }
+        }
+        // 确认后面紧跟 "overload"，再交给 extract 取组名
+        if (after + 8 <= n && str_slice(src, after, after + 8) == "overload") {
+            var nm: string = extract_overload_name(src, after);
+            if (str_len(nm) > 0) { m[nm] = true; }
+        }
+        pos = np + 7;
+    }
+    return m;
+}
+
+// 登记一条 extend 边：from=扩展者单元，to=被扩展单元（设计 §3.1）。
+//   同时登记入边 g_extend_by[to][from] 与出边 g_extends[from][to]，并作废相关缓存键。
+fn register_extend_edge(from: string, to: string) void {
+    if (map_has(g_extend_by, to) == false) {
+        var nm: map[string]bool; g_extend_by[to] = nm;
+    }
+    var mm: map[string]bool = g_extend_by[to];
+    mm[from] = true;
+    g_extend_by[to] = mm;
+    // 出边登记：from 扩展了 to ⇒ from 是被吸收单元（不再单独产出 .tlib）
+    if (map_has(g_extends, from) == false) {
+        var em: map[string]bool; g_extends[from] = em;
+    }
+    var em2: map[string]bool = g_extends[from];
+    em2[to] = true;
+    g_extends[from] = em2;
+    // 新增扩展边改变了 to/from 的有效输入 ⇒ 二者的已缓存键作废，下次重算
+    if (map_has(g_key_cache, to))   { map_del(g_key_cache, to); }
+    if (map_has(g_key_cache, from)) { map_del(g_key_cache, from); }
+}
+
+// Pass 1b：静态分析所有已复制到 libdir 的单元，建出完整 extend 图。
+//   两阶段：① 扫全部单元、建「组名 -> {声明单键}」索引 g_decl_units；
+//           ② 扫每个单元的 extend 名，按名匹配到「声明该组的其他单元」，登记边。
+//   全图已知后才进入 Pass 2 构建（吸收单元跳过独立 .tlib，目标单元折叠闭包）。
+fn load_full_graph() void {
+    // 阶段 ①：组名 -> 声明单元
+    var i: u64 = 0;
+    while (i < slice_len(g_all_units)) {
+        var u: string = g_all_units[i];
+        var f: string = str_concat5(g_libdir, "/", u, ".tc", "");
+        if (path_exists(f)) {
+            var decls: map[string]bool = scan_overload_targets(file_read_all(f));
+            for (nm in decls) {
+                if (map_has(g_decl_units, nm) == false) {
+                    var mm: map[string]bool; g_decl_units[nm] = mm;
                 }
-                var mm: map[string]bool = g_extend_by[to];
-                mm[from] = true;
-                g_extend_by[to] = mm;
-                // 新增扩展边改变了 to 的有效输入 ⇒ 其已缓存的键作废，下次重算
-                if (map_has(g_key_cache, to)) { map_del(g_key_cache, to); }
+                var m2: map[string]bool = g_decl_units[nm];
+                m2[u] = true;
+                g_decl_units[nm] = m2;
             }
         }
-        i = j + 1;
+        i = i + 1;
     }
-}
-
-// 对单元跑一次 tc check --emit-deps，把 extend 边并入 g_extend_by。
-// 失败/无输出时静默返回（保持空表 == 原逻辑，绝不因探测失败中断构建）。
-fn load_extend_graph(name: string) void {
-    var f: string = str_concat5(g_libdir, "/", name, ".tc", "");
-    if (path_exists(f) == false) { return; }
-    // 廉价前置过滤：本单元源里没有 `extend` 关键字 ⇒ 它不可能 extend 任何东西
-    // ⇒ 不可能产出 extend 边。省掉一次 tc 子进程（无 extend 的普通工程零开销）。
-    // 这是「过近似」过滤（注释/字符串里的 extend 会误放行，只是多探测一次，不会漏）。
-    if (str_find(file_read_all(f), "extend", 0) < 0) { return; }
-    var cb: StringBuilder = sb_new();
-    sb_append_str(cb, "\"");
-    sb_append_str(cb, to_bs(g_tc));
-    sb_append_str(cb, "\" check --emit-deps --lib-dir \"");
-    sb_append_str(cb, to_bs(g_libdir));
-    sb_append_str(cb, "\" \"");
-    sb_append_str(cb, to_bs(f));
-    sb_append_str(cb, "\"");
-    var js: string = sys_capture(sb_to_str(cb));
-    if (str_len(js) == 0) { return; }
-    parse_extend_edges(js);
+    // 阶段 ②：extend 名 -> 匹配其他声明单元，登记边
+    var j: u64 = 0;
+    while (j < slice_len(g_all_units)) {
+        var u: string = g_all_units[j];
+        var f: string = str_concat5(g_libdir, "/", u, ".tc", "");
+        if (path_exists(f)) {
+            var exts: map[string]bool = scan_extend_targets(file_read_all(f));
+            for (nm in exts) {
+                if (map_has(g_decl_units, nm) == false) { continue; }
+                var targets: map[string]bool = g_decl_units[nm];
+                for (tv in targets) {
+                    if (tv == u) { continue; }   // 同单元内 extend，tc 原生处理，不记边
+                    register_extend_edge(u, tv);
+                }
+            }
+        }
+        j = j + 1;
+    }
 }
 
 // 传递闭包：返回「直接/间接 extend root 的所有单元」。
@@ -520,8 +626,28 @@ fn sorted_keys(m: map[string]bool) []string {
     return ks;
 }
 
-fn process_dep(name: string, spec_path: string, spec_git: string, rev: string, base_dir: string) void {
-    if (map_has(dep_built, name)) { return; }
+// ────────────────────────────────────────────────────────────────
+// 两趟构建（设计 docs/design/extend-incremental-cache.md §6.2 / §8）
+//
+// 旧的单趟把「解析/复制入口」与「编译」混在一起：load_extend_graph(X) 只能看到
+// X 的【出边】（X 扩展了谁），看不到 X 的【入边】（谁扩展了 X）——入边要等扩展者
+// Y 被处理、且 Y 必须 import X 才能被 emit-deps 发现。这导致：
+//   (1) 顺序耦合的缓存 bug：X 先建、键漏掉 Y 的源，Y 后处理时已无法回滚产物；
+//   (2) 扩展者 Y 被错误地单独编出 Y.tlib，但它本应被折叠进 X 的编译单元。
+//
+// 两趟：
+//   Pass 1 解析/加载图：resolve_dep 递归把所有单元 entry 复制到 libdir 并收集进
+//     g_all_units；load_full_graph 对全部单元做【静态源码分析】，完整建出 extend 图
+//     （g_extend_by 入边 + g_extends 出边），不依赖 tc --emit-deps、零子进程。此时全图已知。
+//   Pass 2 构建：build_unit 按拓扑序对每个【根单元】（g_extends 为空，即不被吸收）
+//     产出 .tlib，并把其「扩展闭包」折叠进同一编译单元；被吸收单元（g_extends 非空）
+//     直接跳过，不再单独产出 .tlib。
+// ────────────────────────────────────────────────────────────────
+
+// Pass 1a：解析 + 复制入口（不做任何编译）。递归处理子依赖。
+fn resolve_dep(name: string, spec_path: string, spec_git: string, rev: string, base_dir: string) void {
+    if (map_has(g_unit_seen, name)) { return; }
+    g_unit_seen[name] = true;
     var dir: string = "";
     if (str_len(spec_path) > 0) {
         dep_kind[name] = "path";
@@ -563,23 +689,71 @@ fn process_dep(name: string, spec_path: string, spec_git: string, rev: string, b
             var srev: string = toml.get_str(ddoc, sb, "rev", "");
             if (str_len(srev) == 0) { srev = toml.get_str(ddoc, sb, "branch", ""); }
             if (str_len(srev) == 0) { srev = toml.get_str(ddoc, sb, "tag", ""); }
-            process_dep(s, sp, sg, srev, dir);
+            resolve_dep(s, sp, sg, srev, dir);
         }
     }
     dep_entry[name] = entry;
 
-    // 构建：复制 entry -> libdir/<name>.tc，并 tc build --lib 出 .tlib
+    // 仅复制 entry -> libdir/<name>.tc（供 emit-deps 与 Pass 2 构建），不编译
     var fullentry: string = str_concat4(dir, "/", entry, "");
     var libfile: string = str_concat5(g_libdir, "/", name, ".tc", "");
     if (file_copy(fullentry, libfile) != 0) {
         eprint(str_concat3("tote: 复制依赖入口失败: ", fullentry, "\n"));
         return;
     }
-    // extend 图：向 tc 询问本单元的依赖边并填充 g_extend_by。
-    // 必须在 key_of 之前调用，否则键会漏掉扩展闭包的源（设计 §4.1 调用点）。
-    // 当前 tc 不输出 extend 边 ⇒ 空表 ⇒ 与原逻辑一致。
-    load_extend_graph(name);
-    // 增量缓存：键命中则跳过 tc 调用
+    append(g_all_units, name);
+}
+
+// 解析主清单里声明的 [dependencies] / [dev-dependencies]，进入 Pass 1。
+fn resolve_all_deps(doc: i64) void {
+    var names: map[string]bool;
+    toml.get_child_tables(doc, "dependencies", names);
+    for (name in names) {
+        var base: string = str_concat3("dependencies.", name, "");
+        var p: string  = toml.get_str(doc, base, "path", "");
+        var g: string  = toml.get_str(doc, base, "git", "");
+        var rev: string = toml.get_str(doc, base, "rev", "");
+        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "branch", ""); }
+        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "tag", ""); }
+        resolve_dep(name, p, g, rev, ".");
+    }
+    var dnames: map[string]bool;
+    toml.get_child_tables(doc, "dev-dependencies", dnames);
+    for (name in dnames) {
+        var base: string = str_concat3("dev-dependencies.", name, "");
+        var p: string  = toml.get_str(doc, base, "path", "");
+        var g: string  = toml.get_str(doc, base, "git", "");
+        var rev: string = toml.get_str(doc, base, "rev", "");
+        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "branch", ""); }
+        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "tag", ""); }
+        resolve_dep(name, p, g, rev, ".");
+    }
+}
+
+// Pass 2：按拓扑序构建依赖单元。
+//   • 被吸收单元（g_extends[name] 非空，即它 extend 了别人）不单独产出 .tlib，
+//     其内容在「被扩展单元」构建时被折叠进同一编译单元（tc 多文件 --lib）。
+//   • 其余根单元各自产出 .tlib；构建前先递归构建其导入的根依赖（保证 tc 类型
+//     检查能解析 .tlib）。
+fn build_unit(name: string) void {
+    if (map_has(dep_built, name)) { return; }
+    // 被吸收：跳过独立构建（其源会在目标单元的闭包里被折叠）
+    if (map_has(g_extends, name)) {
+        dep_built[name] = true;
+        println(str_concat3("tote: 跳过被吸收单元 ", name, "（作为 extend 并入目标单元）"));
+        return;
+    }
+    // 拓扑序：先构建本单元导入的根依赖
+    var imps: map[string]bool = imports_of(str_concat5(g_libdir, "/", name, ".tc", ""));
+    for (imp in imps) {
+        if (map_has(dep_path, imp) && map_has(g_unit_seen, imp)) {
+            build_unit(imp);
+        }
+    }
+    // 构建本单元（带扩展闭包）
+    var dir: string    = dep_path[name];
+    var entry: string  = dep_entry[name];
+    var fullentry: string = str_concat4(dir, "/", entry, "");
     var dep_artifact: string = str_concat5(g_libdir, "/", name, ".tlib", "");
     var dep_key: u64 = key_of(name, false);
     if (path_exists(dep_artifact) && stored_key_matches(key_path_of(dep_artifact), dep_key)) {
@@ -602,7 +776,6 @@ fn process_dep(name: string, spec_path: string, spec_git: string, rev: string, b
     // extend：把「扩展本单元的模块」的传递闭包拼进【同一个编译单元】（设计 §3.2 / §4.2）。
     //   跨文件 extend overload 要求被扩展模块与其扩展模块同单元编译，否则报 EXTEND_NO_GROUP。
     //   被扩展模块恒为第一个位置参数（= 单元名），闭包按名升序追加 ⇒ 顺序稳定（设计 §8）。
-    //   当前 g_extend_by 为空 ⇒ 不追加任何文件，命令行与原逻辑逐字节一致。
     var unit_ext: map[string]bool = transitive_closure(name);
     var unit_names: []string = sorted_keys(unit_ext);
     var ui: u64 = 0;
@@ -623,15 +796,15 @@ fn process_dep(name: string, spec_path: string, spec_git: string, rev: string, b
     }
     dep_built[name] = true;
     write_key(key_path_of(dep_artifact), dep_key);
-    var msb: StringBuilder = sb_new();
-    sb_append_str(msb, "tote: 已构建依赖 ");
-    sb_append_str(msb, name);
-    sb_append_str(msb, " -> ");
-    sb_append_str(msb, g_libdir);
-    sb_append_str(msb, "/");
-    sb_append_str(msb, name);
-    sb_append_str(msb, ".tlib");
-    println(sb_to_str(msb));
+    var ok: StringBuilder = sb_new();
+    sb_append_str(ok, "tote: 已构建依赖 ");
+    sb_append_str(ok, name);
+    sb_append_str(ok, " -> ");
+    sb_append_str(ok, g_libdir);
+    sb_append_str(ok, "/");
+    sb_append_str(ok, name);
+    sb_append_str(ok, ".tlib");
+    println(sb_to_str(ok));
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -768,29 +941,15 @@ fn cmd_build_or_run(do_run: bool) i32 {
     mkdir_p("out/rls");
     ensure_runtime_lib();
 
-    // 主清单依赖
-    var names: map[string]bool;
-    toml.get_child_tables(doc, "dependencies", names);
-    for (name in names) {
-        var base: string = str_concat3("dependencies.", name, "");
-        var p: string  = toml.get_str(doc, base, "path", "");
-        var g: string  = toml.get_str(doc, base, "git", "");
-        var rev: string = toml.get_str(doc, base, "rev", "");
-        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "branch", ""); }
-        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "tag", ""); }
-        process_dep(name, p, g, rev, ".");
-    }
-    // dev 依赖（同样纳入 lib-dir，便于测试目标导入）
-    var dnames: map[string]bool;
-    toml.get_child_tables(doc, "dev-dependencies", dnames);
-    for (name in dnames) {
-        var base: string = str_concat3("dev-dependencies.", name, "");
-        var p: string  = toml.get_str(doc, base, "path", "");
-        var g: string  = toml.get_str(doc, base, "git", "");
-        var rev: string = toml.get_str(doc, base, "rev", "");
-        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "branch", ""); }
-        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "tag", ""); }
-        process_dep(name, p, g, rev, ".");
+    // ── Pass 1 解析/加载图：解析全部依赖 + 复制 entry 到 libdir + 加载 extend 图 ──
+    resolve_all_deps(doc);
+    load_full_graph();
+
+    // ── Pass 2 构建：按拓扑序构建依赖单元（被吸收单元自动跳过）──
+    var ui2: u64 = 0;
+    while (ui2 < slice_len(g_all_units)) {
+        build_unit(g_all_units[ui2]);
+        ui2 = ui2 + 1;
     }
 
     // 构建主程序
@@ -858,18 +1017,9 @@ fn cmd_check() i32 {
     mkdir_p("out/rls");
     ensure_runtime_lib();
 
-    // 先把依赖 .tc 备好（check 需要 lib-dir 中的 .tc）
-    var names: map[string]bool;
-    toml.get_child_tables(doc, "dependencies", names);
-    for (name in names) {
-        var base: string = str_concat3("dependencies.", name, "");
-        var p: string  = toml.get_str(doc, base, "path", "");
-        var g: string  = toml.get_str(doc, base, "git", "");
-        var rev: string = toml.get_str(doc, base, "rev", "");
-        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "branch", ""); }
-        if (str_len(rev) == 0) { rev = toml.get_str(doc, base, "tag", ""); }
-        process_dep(name, p, g, rev, ".");
-    }
+    // 先把依赖 .tc 备好（check 需要 lib-dir 中的 .tc）：Pass 1 解析 + 加载图，不构建
+    resolve_all_deps(doc);
+    load_full_graph();
 
     var entry: string = toml.get_str(doc, "package", "entry", "src/main.tc");
     var cmd: StringBuilder = sb_new();
@@ -940,7 +1090,7 @@ fn main() i32 @main {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 附录：extend 与增量缓存 —— tc 与 tote 的职责划分（提交 tc 工程的核心）
+// 附录：extend 与增量缓存 —— tc 与 tote 的职责划分
 //
 // 现象（用户所述）：模块自身源码未改，但被别的模块 `extend overload fn`
 // 扩展后，其编译产物的「有效输入」已变。根因：跨文件 extend 要求【被扩展
@@ -948,30 +1098,43 @@ fn main() i32 @main {
 // tc_load_src / Route 2，否则报 EXTEND_NO_GROUP）。故被扩展模块的缓存键
 // 必须包含「扩展它的模块的源」。
 //
-// ── 核心需提交 tc 的部分 ──
-//   1) 暴露 extend 图：--emit-deps 目前只输出 import 边（from→to）。tc 应
-//      额外输出 extended_by 边（Y extend overload 指向 X 的组 →
-//      {from:Y, to:X, kind:"extend"}）。tote 据此：
-//        (a) 计算被扩展模块的「有效输入闭包」= 自身源 + extended_by 闭包源；
-//        (b) 把该闭包与原模块拼成【一个多文件编译单元】交给 tc build --lib
-//            （多文件参数），否则 overload 子句无法跨文件合并。
-//   2) （更优可选）内容寻址增量编译下沉 tc：tc build --lib --unit-key <h>，
-//      由 tc 维护 .tlib 内容哈希缓存并复用。tote 只传「有效输入哈希+文件
-//      集合」，extend 合并的正确性完全由 tc 负责，tote 不必理解 extend 内部。
+// ── extend 边如何发现（关键工程决策 · 2026-10-16）──
+//   最初设计（设计 §3.1）依赖 tc 的 `--emit-deps` 输出 {from:Y,to:X,kind:"extend"}。
+//   **但实测证伪该假设**：tc 的 `check --emit-deps` 在（合并或单文件）单元上均只输出
+//   import 边，跨文件 extend 边在任何场景都报不出——被扩展的 overload 组必须进入
+//   「当前单元」的 decl_list 才能被 emit_deps 按名匹配，而 per-unit 探测时扩展者并未
+//   把目标拉进同一单元；且 `build --lib` 根本不接受 `--emit-deps`。⇒ 不能依赖 tc。
+//   故 tote 改为【Pass 1 静态源码分析】（见 load_full_graph / scan_overload_targets /
+//   scan_extend_targets）：扫每个 libdir 单元的源码——
+//     • `overload fn NAME`（前词非 extend）⇒ 该单元「声明」名为 NAME 的 overload 组；
+//     • `extend overload fn NAME` ⇒ 该单元「扩展」名为 NAME 的 overload 组。
+//   把「扩展名」按名匹配到「声明该组的其他单元」即得边 {from:扩展者, to:被扩展者}。
+//   这与 tc 内部按名合并 overload 组的口径一致（跨文件 extend 本就是同单元内按名合并），
+//   忠实于 tc 语义；且纯字符串扫描、零 tc 子进程，无 extend 的普通工程零开销。
 //
-// ── tote 现在做什么 ──
+// ── tote 现在做什么（2026-10-16 更新：两趟拆分 + 静态分析已落地并端到端验证）──
 //   • 已实现基于 import 图的增量缓存：单元键 = fnv(名 ‖ 自身源哈希 ‖ 直接
 //     @import 依赖的键)。命中跳过 tc；依赖源变 → 键变 → 级联重建（已验证：
-//     改 bar → bar/foo/main 重建，baz 复用）。
-//   • ✅ 接线已完成（2026-10-15，设计 §7 阶段 1+2）：load_extend_graph 在
-//     process_dep 复制 entry 后、key_of 之前调用；key_of 与 tc build --lib 均按
-//     【传递闭包 + 名升序】处理，保证语义与哈希顺序的稳定性。
-//   • ✅ 当前 tc 不输出 kind:"extend" ⇒ g_extend_by 恒空 ⇒ 闭包为空 ⇒
-//     不追加任何文件、键不变。已用「git HEAD 原版 vs 改动版」双二进制在同一
-//     fixture 上对比验证：冷/热构建日志、tote.lock、app.ll、缓存键全部逐字节一致。
-//   • 另加前置过滤：单元源中无 `extend` 关键字则跳过 tc 探测 ⇒ 无 extend 的
-//     普通工程不付出任何额外子进程开销。
-//   • ⏸ 仍待 tc：REQ-EXT-1/2/3（跨文件 extend overload 解析、--emit-deps 输出
-//     extend 边、build --lib 接受多文件）。就位后即可启用，缓存主体无需再改。
+//     改 bar → bar/foo/main 重建，baz 复用；非 extend 路径零行为变化）。
+//   • ✅ 两趟构建已落地：单趟 process_dep 拆为
+//       Pass 1 解析/加载图（resolve_dep 递归复制 entry 到 libdir + load_full_graph
+//       对全部单元做静态源码分析，建出完整 extend 图 g_extend_by/g_extends）与
+//       Pass 2 构建（build_unit 按拓扑序构建根单元；g_extends 非空者=被吸收单元，
+//       跳过独立 .tlib，其源在目标单元的闭包里被折叠）。
+//       由此根治：(1) 顺序耦合的缓存 bug（全图已知后再算键）；(2) 扩展者被错误
+//       单独构建（吸收 ⇒ 不产 .tlib）。
+//   • ✅ extend 边已生效（静态分析）：scan_extend_targets 匹配 overload 组名，
+//     同时登记 g_extend_by（入边）与 g_extends（出边）；key_of 与 tc build --lib
+//     仍按【传递闭包 + 名升序】处理，顺序稳定。
+//   • ✅ 端到端验证通过（tests/extend_pkg）：base 声明 overload fn op；ext
+//     `extend overload fn op(0,b)`（值模式，跨文件分发）；main @import("base")。
+//       — 冷构建：base.tlib 含 ext 子句、ext.tlib 不产出、app 链接成功；
+//       — 运行：op(0,5)=500（ext 值模式）、op(2,3)=5（base）；
+//       — 改 ext ⇒ base 折叠新 ext 重建、app 重建；改 base ⇒ base 重建、app 重建；
+//       — 未改动时全量复用缓存。级联重建与「吸收⇒不产 .tlib」均正确。
+//   • ⚠ 已知近似：静态分析按 overload 组【名】匹配扩展目标。若不同模块声明了
+//     同名 overload 组，extender 可能被折叠进错误单元。 overload 组名按惯例
+//     模块内唯一，MVP 下可接受；后续若需精确，可再结合 tc 的单元归属信息。
 // ═══════════════════════════════════════════════════════════════════
+
 

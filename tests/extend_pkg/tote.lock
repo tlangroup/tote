@@ -1,0 +1,17 @@
+# tote.lock — 自动生成，永远提交（DESIGN D10）
+[lock]
+version = "1"
+mode = "dbg"
+
+[dependencies.base]
+name = "base"
+source = "path"
+resolved = "libs/base"
+entry = "src/base.tc"
+
+[dependencies.ext]
+name = "ext"
+source = "path"
+resolved = "libs/ext"
+entry = "src/ext.tc"
+
